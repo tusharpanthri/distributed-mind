@@ -1,0 +1,38 @@
+minio:
+  endpoint: "${MINIO_ENDPOINT:http://localhost:9000}"
+  access_key: "${MINIO_ROOT_USER:minioadmin}"
+  secret_key: "${MINIO_ROOT_PASSWORD:minioadmin}"
+  bucket_raw: "${MINIO_BUCKET_RAW:raw-data}"
+  bucket_output: "${MINIO_BUCKET_OUTPUT:processed-data}"
+
+data:
+  gharchive_base_url: "https://data.gharchive.org"
+  default_date: "2024-01-15"
+  default_hours: 24
+  sample_size: 50000        # rows cap for CI; 0 = no cap
+  raw_prefix: "events"      # raw-data/events/date=YYYY-MM-DD/
+  lookup_key: "lookup/repo_metadata.parquet"
+
+benchmark:
+  engines:
+    - spark
+    - dask
+    - ray
+  output_dir: "results"
+  input_path: "s3a://raw-data/events"
+  output_path: "s3a://processed-data/output"
+  lookup_path: "s3a://raw-data/lookup/repo_metadata.parquet"
+
+spark:
+  master: "local[*]"
+  app_name: "DistributedMind-Benchmark"
+  # S3A settings injected at runtime via SparkConf
+
+dask:
+  n_workers: 2
+  threads_per_worker: 2
+  memory_limit: "2GB"
+
+ray:
+  num_cpus: 4
+  object_store_memory: 1073741824   # 1 GB

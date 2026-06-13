@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(New-Item -ItemType File -Force results/.gitkeep)",
+      "Bash(Out-Null)"
+    ]
+  }
+}
