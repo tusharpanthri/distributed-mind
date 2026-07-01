@@ -6,8 +6,6 @@ import logging
 from typing import Any
 
 import pandas as pd
-import pyarrow as pa
-import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pyarrow.parquet as pq
 import ray

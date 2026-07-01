@@ -74,8 +74,8 @@ def _print_table(results: list[BenchmarkResult]) -> None:
     print(header)
     print("-" * len(header))
     for r in results:
-        status = "✓" if r.success else "✗"
-        rps = f"{r.rows_per_second:,.0f}" if r.success else "—"
+        status = "OK" if r.success else "FAIL"
+        rps = f"{r.rows_per_second:,.0f}" if r.success else "n/a"
         print(
             f"{r.engine_name:<10} "
             f"{r.duration_seconds:>14.2f} "

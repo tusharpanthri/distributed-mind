@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Generator
 
 import psutil

@@ -21,7 +21,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import yaml
 from minio import Minio
-from minio.error import S3Error
 from pythonjsonlogger import jsonlogger
 
 # ---------------------------------------------------------------------------
@@ -149,7 +148,8 @@ def _stream_hourly_file(url: str) -> Iterator[dict]:
     import urllib.request
 
     logger.info("Downloading", extra={"url": url})
-    with urllib.request.urlopen(url, timeout=60) as response:  # noqa: S310
+    req = urllib.request.Request(url, headers={"User-Agent": "distributedmind-benchmark/1.0"})  # noqa: S310
+    with urllib.request.urlopen(req, timeout=120) as response:  # noqa: S310
         with gzip.GzipFile(fileobj=io.BytesIO(response.read())) as gz:
             for line in gz:
                 line = line.strip()

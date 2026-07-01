@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import io
-import os
 from typing import Any
-from unittest.mock import MagicMock, patch
 
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest

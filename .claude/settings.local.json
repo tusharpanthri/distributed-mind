@@ -2,7 +2,26 @@
   "permissions": {
     "allow": [
       "Bash(New-Item -ItemType File -Force results/.gitkeep)",
-      "Bash(Out-Null)"
+      "Bash(Out-Null)",
+      "Bash(docker --version)",
+      "Bash(docker compose *)",
+      "Bash(java -version)",
+      "Bash(docker info *)",
+      "Bash(pip install *)",
+      "Bash(python -m ruff check .)",
+      "Bash(python -m ruff check . --fix)",
+      "Bash(python -m mypy engines/ benchmark/ data/ --ignore-missing-imports)",
+      "Bash(python -m pytest tests/test_engines.py -v --timeout=60)",
+      "Bash(python *)",
+      "Bash(pip uninstall *)",
+      "Bash(curl -I \"https://data.gharchive.org/2024-01-15-0.json.gz\")",
+      "Bash(MINIO_ENDPOINT=http://localhost:9000 MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin python -m data.download_gharchive_data --date 2024-01-15 --hours 1 --sample-size 50000)",
+      "Bash(git status *)",
+      "Bash(git check-ignore *)",
+      "Bash(git reset *)",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
