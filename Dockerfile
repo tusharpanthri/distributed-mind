@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Python dependency builder
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim AS builder
+FROM python:3.11-slim-bookworm AS builder
 
 WORKDIR /build
 
@@ -18,7 +18,7 @@ RUN pip install --upgrade pip && \
 # ---------------------------------------------------------------------------
 # Stage 2: Java runtime for PySpark
 # ---------------------------------------------------------------------------
-FROM python:3.11-slim AS runtime
+FROM python:3.11-slim-bookworm AS runtime
 
 # Java 17 (headless) for PySpark
 RUN apt-get update && apt-get install -y --no-install-recommends \

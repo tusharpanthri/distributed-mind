@@ -58,6 +58,10 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
       MINIO_BUCKET_RAW: raw-data
       MINIO_BUCKET_OUTPUT: processed-data
+      # botocore >=1.36 defaults to checksum headers this MinIO release
+      # rejects on bulk-delete/overwrite calls (used by Dask's to_parquet).
+      AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+      AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
     volumes:
       - ./results:/app/results
       - ./config:/app/config

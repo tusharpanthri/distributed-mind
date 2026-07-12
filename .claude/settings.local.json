@@ -21,7 +21,13 @@
       "Bash(git reset *)",
       "Bash(git rm *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(MINIO_ENDPOINT=http://localhost:9000 MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin python -m benchmark.runner --engines spark --output results/run_spark_debug.json)",
+      "Bash(docker run *)",
+      "Bash(MSYS_NO_PATHCONV=1 docker compose run --rm --entrypoint grep benchmark -n \"requires-md5\\\\|Md5\\\\|md5\" /usr/local/lib/python3.11/site-packages/botocore/data/s3/2006-03-01/service-2.json)",
+      "Bash(MSYS_NO_PATHCONV=1 docker compose run --rm --entrypoint python benchmark -c ' *)",
+      "Bash(MINIO_ENDPOINT=http://localhost:9000 MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin python -m pytest tests/ -v)",
+      "Bash(MSYS_NO_PATHCONV=1 docker compose run --rm --entrypoint python -e MINIO_ENDPOINT=http://minio:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin benchmark -m pytest tests/ -v)"
     ]
   }
 }

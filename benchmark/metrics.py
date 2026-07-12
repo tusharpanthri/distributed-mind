@@ -16,18 +16,29 @@ class RunMetrics:
     peak_memory_mb: float = 0.0
 
 
+def _tree_rss_mb(process: psutil.Process) -> float:
+    """RSS of this process plus all its children (e.g. PySpark's JVM subprocess)."""
+    total = 0
+    for proc in [process, *process.children(recursive=True)]:
+        try:
+            total += proc.memory_info().rss
+        except psutil.NoSuchProcess:
+            continue
+    return total / 1024 / 1024
+
+
 @contextmanager
 def measure(metrics: RunMetrics) -> Generator[None, None, None]:
-    """Context manager that records wall-clock time and peak RSS memory."""
+    """Context manager that records wall-clock time and peak RSS memory,
+    including child processes so JVM-backed engines (PySpark) are captured.
+    """
     process = psutil.Process()
-    baseline_mb = process.memory_info().rss / 1024 / 1024
-    peak_mb = baseline_mb
+    baseline_mb = _tree_rss_mb(process)
     start = time.perf_counter()
 
     try:
         yield
     finally:
         metrics.duration_seconds = time.perf_counter() - start
-        current_mb = process.memory_info().rss / 1024 / 1024
-        peak_mb = max(peak_mb, current_mb)
-        metrics.peak_memory_mb = peak_mb - baseline_mb
+        current_mb = _tree_rss_mb(process)
+        metrics.peak_memory_mb = max(0.0, current_mb - baseline_mb)

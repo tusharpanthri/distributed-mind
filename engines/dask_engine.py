@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 import dask.dataframe as dd
 import pandas as pd
 from dask.distributed import Client, LocalCluster
+from minio import Minio
+from minio.deleteobjects import DeleteObject
 
 from benchmark.metrics import RunMetrics, measure
 from engines.base import BenchmarkEngine, BenchmarkResult
@@ -80,6 +83,31 @@ class DaskEngine(BenchmarkEngine):
                 error_message=str(exc),
             )
 
+    def _clear_output_prefix(self, output_path: str) -> None:
+        """Delete existing objects under output_path via the MinIO SDK.
+
+        s3fs's async bulk-delete (used by dask's to_parquet overwrite=True)
+        fails against this MinIO release with a MissingContentMD5 error, so
+        the prefix is cleared here with the synchronous minio client instead.
+        """
+        minio_cfg = self._config["minio"]
+        parsed = urlparse(output_path)
+        bucket = parsed.netloc
+        prefix = parsed.path.lstrip("/")
+
+        client = Minio(
+            minio_cfg["endpoint"].replace("http://", "").replace("https://", ""),
+            access_key=minio_cfg["access_key"],
+            secret_key=minio_cfg["secret_key"],
+            secure=minio_cfg["endpoint"].startswith("https"),
+        )
+        if not client.bucket_exists(bucket):
+            return
+        objects = client.list_objects(bucket, prefix=prefix, recursive=True)
+        delete_objects = (DeleteObject(obj.object_name) for obj in objects)
+        for error in client.remove_objects(bucket, delete_objects):
+            logger.warning("Failed to delete object", extra={"error": str(error)})
+
     def _transform(self, input_path: str, output_path: str, lookup_path: str) -> tuple[int, int]:
         minio = self._config["minio"]
         storage_options = {
@@ -102,16 +130,24 @@ class DaskEngine(BenchmarkEngine):
         ]
         rows_processed = int(len(events))
 
-        # 3. Group by repo_id / repo_name, compute aggregates
+        # 3. Group by repo_id / repo_name, compute aggregates.
+        # "nunique" isn't accepted inside groupby().agg() on this dask-expr
+        # version, so it's computed as its own dedicated groupby call and merged.
         aggregated = (
             events.groupby(["repo_id", "repo_name"])
             .agg(
                 event_count=("type", "count"),
-                unique_actors=("actor_login", "nunique"),
                 avg_payload_size=("payload_size", "mean"),
             )
             .reset_index()
         )
+        unique_actors = (
+            events.groupby(["repo_id", "repo_name"])["actor_login"]
+            .nunique()
+            .rename("unique_actors")
+            .reset_index()
+        )
+        aggregated = aggregated.merge(unique_actors, on=["repo_id", "repo_name"], how="left")
 
         # 4. Join with repo-metadata lookup (left join → unknown for missing)
         lookup_pd: pd.DataFrame = dd.read_parquet(s3_lookup, storage_options=storage_options).compute()
@@ -119,13 +155,17 @@ class DaskEngine(BenchmarkEngine):
         enriched["language"] = enriched["language"].fillna("unknown")
         enriched["repo_owner_type"] = enriched["repo_owner_type"].fillna("unknown")
 
-        # 5. Write partitioned by language
+        # 5. Write partitioned by language.
+        # Prefix is cleared explicitly first (see _clear_output_prefix); the
+        # write itself uses overwrite=False so dask never triggers s3fs's
+        # bulk-delete path.
+        self._clear_output_prefix(s3_output)
         enriched.to_parquet(
             s3_output,
             partition_on=["language"],
             storage_options=storage_options,
             write_index=False,
-            overwrite=True,
+            overwrite=False,
         )
 
         rows_output = int(len(enriched))

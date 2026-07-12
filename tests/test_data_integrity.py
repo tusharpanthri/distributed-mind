@@ -135,12 +135,16 @@ def test_aggregate_values_match(all_results: dict) -> None:
     if len(frames) < 2:
         pytest.skip("Fewer than 2 engines produced output")
 
+    # Indexed on (repo_id, repo_name) rather than repo_id alone: a repo_id can
+    # appear under more than one repo_name within the sample window (renames),
+    # and sorting by repo_id only doesn't guarantee the same tie-break order
+    # across engines, which misaligns rows during comparison.
     engine_names = list(frames.keys())
     ref_name = engine_names[0]
-    ref = frames[ref_name].set_index("repo_id").sort_index()
+    ref = frames[ref_name].set_index(["repo_id", "repo_name"]).sort_index()
 
     for other_name in engine_names[1:]:
-        other = frames[other_name].set_index("repo_id").sort_index()
+        other = frames[other_name].set_index(["repo_id", "repo_name"]).sort_index()
 
         # Row-level event_count must match exactly
         common = ref.index.intersection(other.index)
