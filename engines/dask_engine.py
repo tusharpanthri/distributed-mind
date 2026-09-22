@@ -12,14 +12,15 @@ from dask.distributed import Client, LocalCluster
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 
-from benchmark.metrics import RunMetrics, measure
-from engines.base import BenchmarkEngine, BenchmarkResult
+from engines.base import BenchmarkEngine, raise_injected_failure
 
 logger = logging.getLogger("distributedmind.dask")
 
 
 class DaskEngine(BenchmarkEngine):
     """Runs the benchmark transformation using Dask with a LocalCluster."""
+
+    name = "dask"
 
     def __init__(self) -> None:
         super().__init__()
@@ -55,34 +56,6 @@ class DaskEngine(BenchmarkEngine):
     # Transformation
     # ------------------------------------------------------------------
 
-    def run(self, input_path: str, output_path: str) -> BenchmarkResult:
-        metrics = RunMetrics()
-
-        try:
-            with measure(metrics):
-                lookup_path = self._config["benchmark"]["lookup_path"]
-                rows_processed, rows_output = self._transform(input_path, output_path, lookup_path)
-
-            return BenchmarkResult(
-                engine_name="dask",
-                duration_seconds=metrics.duration_seconds,
-                rows_processed=rows_processed,
-                rows_output=rows_output,
-                peak_memory_mb=metrics.peak_memory_mb,
-                success=True,
-            )
-        except Exception as exc:
-            logger.exception("Dask run failed")
-            return BenchmarkResult(
-                engine_name="dask",
-                duration_seconds=metrics.duration_seconds,
-                rows_processed=0,
-                rows_output=0,
-                peak_memory_mb=metrics.peak_memory_mb,
-                success=False,
-                error_message=str(exc),
-            )
-
     def _clear_output_prefix(self, output_path: str) -> None:
         """Delete existing objects under output_path via the MinIO SDK.
 
@@ -108,7 +81,14 @@ class DaskEngine(BenchmarkEngine):
         for error in client.remove_objects(bucket, delete_objects):
             logger.warning("Failed to delete object", extra={"error": str(error)})
 
-    def _transform(self, input_path: str, output_path: str, lookup_path: str) -> tuple[int, int]:
+    def _transform(
+        self,
+        input_path: str,
+        output_path: str,
+        lookup_path: str,
+        mitigate_skew: bool,
+        inject_failure: bool,
+    ) -> tuple[int, int]:
         minio = self._config["minio"]
         storage_options = {
             "key": minio["access_key"],
@@ -128,26 +108,34 @@ class DaskEngine(BenchmarkEngine):
         events = events[
             (events["type"] == "PushEvent") & events["repo_id"].notnull()
         ]
+        if inject_failure:
+            events = events.map_partitions(_failing_partition, meta=events._meta)
+        # Filtered events are materialized once, then counted and aggregated
+        # (Spark caches and Ray materializes at the same point).
+        events = events.persist()
         rows_processed = int(len(events))
 
-        # 3. Group by repo_id / repo_name, compute aggregates.
-        # "nunique" isn't accepted inside groupby().agg() on this dask-expr
-        # version, so it's computed as its own dedicated groupby call and merged.
-        aggregated = (
-            events.groupby(["repo_id", "repo_name"])
-            .agg(
-                event_count=("type", "count"),
-                avg_payload_size=("payload_size", "mean"),
+        # 3. Group by repo_id / repo_name, compute aggregates
+        if mitigate_skew:
+            aggregated = self._aggregate_repartitioned(events)
+        else:
+            # "nunique" isn't accepted inside groupby().agg() on this dask-expr
+            # version, so it's computed as its own dedicated groupby call and merged.
+            aggregated = (
+                events.groupby(["repo_id", "repo_name"])
+                .agg(
+                    event_count=("type", "count"),
+                    avg_payload_size=("payload_size", "mean"),
+                )
+                .reset_index()
             )
-            .reset_index()
-        )
-        unique_actors = (
-            events.groupby(["repo_id", "repo_name"])["actor_login"]
-            .nunique()
-            .rename("unique_actors")
-            .reset_index()
-        )
-        aggregated = aggregated.merge(unique_actors, on=["repo_id", "repo_name"], how="left")
+            unique_actors = (
+                events.groupby(["repo_id", "repo_name"])["actor_login"]
+                .nunique()
+                .rename("unique_actors")
+                .reset_index()
+            )
+            aggregated = aggregated.merge(unique_actors, on=["repo_id", "repo_name"], how="left")
 
         # 4. Join with repo-metadata lookup (left join → unknown for missing)
         lookup_pd: pd.DataFrame = dd.read_parquet(s3_lookup, storage_options=storage_options).compute()
@@ -170,3 +158,69 @@ class DaskEngine(BenchmarkEngine):
 
         rows_output = int(len(enriched))
         return rows_processed, rows_output
+
+    def _aggregate_repartitioned(self, events: dd.DataFrame) -> dd.DataFrame:
+        """Repartition informed by the key distribution before the groupby.
+
+        Input is first rebalanced into evenly sized partitions (one big
+        Parquet file otherwise lands in a single partition). Rows of the top-N
+        repos get a salt so they hash to different output partitions
+        (``split_out``) instead of piling onto one, then partials are combined.
+        Distinct actors come from de-duplicated (repo, actor) pairs, which
+        shuffle on the actor too and so don't concentrate on a hot repo.
+        """
+        skew_cfg = self._config.get("skew", {})
+        top_n = int(skew_cfg.get("hot_key_top_n", 10))
+        buckets = int(skew_cfg.get("salt_buckets", 8))
+        dask_cfg = self._config.get("dask", {})
+        n_parts = max(2, 2 * int(dask_cfg.get("n_workers", 2)) * int(dask_cfg.get("threads_per_worker", 2)))
+
+        hot_ids = set(events["repo_id"].value_counts().nlargest(top_n).index.compute().tolist())
+        events = events.repartition(npartitions=n_parts)
+        salted = events.map_partitions(_add_salt, hot_ids, buckets)
+
+        partial = (
+            salted.groupby(["repo_id", "repo_name", "salt"])
+            .agg(
+                cnt=("type", "count"),
+                psum=("payload_size", "sum"),
+                pcnt=("payload_size", "count"),
+                split_out=n_parts,
+            )
+            .reset_index()
+        )
+        # The combine stage sees at most ``buckets`` partial rows per repo, so it
+        # needs no split_out (and a second split_out here trips a dask-expr
+        # optimizer KeyError when the result is merged below).
+        additive = (
+            partial.groupby(["repo_id", "repo_name"])
+            .agg(event_count=("cnt", "sum"), psum=("psum", "sum"), pcnt=("pcnt", "sum"))
+            .reset_index()
+        )
+        additive["avg_payload_size"] = additive["psum"] / additive["pcnt"].where(additive["pcnt"] > 0)
+        additive = additive.drop(columns=["psum", "pcnt"])
+
+        distinct_actors = (
+            events[["repo_id", "repo_name", "actor_login"]]
+            .dropna(subset=["actor_login"])
+            .drop_duplicates(split_out=n_parts)
+            .groupby(["repo_id", "repo_name"])
+            .size(split_out=n_parts)
+            .rename("unique_actors")
+            .reset_index()
+        )
+        return additive.merge(distinct_actors, on=["repo_id", "repo_name"], how="left")
+
+
+def _add_salt(part: pd.DataFrame, hot_ids: set[int], buckets: int) -> pd.DataFrame:
+    salt = pd.util.hash_pandas_object(part["id"], index=False).to_numpy() % buckets
+    part = part.assign(salt=salt.astype("int64"))
+    part.loc[~part["repo_id"].isin(hot_ids), "salt"] = 0
+    return part
+
+
+def _failing_partition(part: pd.DataFrame) -> pd.DataFrame:
+    """Runs on a Dask worker; the task errors and dask surfaces it on compute."""
+    if len(part):
+        raise_injected_failure("dask")
+    return part

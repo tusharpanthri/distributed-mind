@@ -132,3 +132,17 @@ def test_dask_engine_importable() -> None:
 def test_ray_engine_importable() -> None:
     from engines.ray_engine import RayEngine
     assert RayEngine is not None
+
+
+def test_measure_captures_peak_not_final_memory() -> None:
+    from benchmark.metrics import RunMetrics, measure
+
+    metrics = RunMetrics()
+    with measure(metrics, sample_interval=0.01):
+        blob = bytearray(200 * 1024 * 1024)  # allocate, hold briefly, then free
+        blob[::4096] = b"x" * len(blob[::4096])
+        import time
+        time.sleep(0.2)
+        del blob
+    assert metrics.peak_memory_mb > 150
+    assert metrics.duration_seconds >= 0.2

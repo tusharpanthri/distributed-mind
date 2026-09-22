@@ -11,6 +11,7 @@ data:
   default_hours: 24
   sample_size: 50000        # rows cap for CI; 0 = no cap
   raw_prefix: "events"      # raw-data/events/date=YYYY-MM-DD/
+  skewed_prefix: "events-skewed"  # raw-data/events-skewed/date=YYYY-MM-DD/ (amplify_skew.py)
   lookup_key: "lookup/repo_metadata.parquet"
 
 benchmark:
@@ -20,11 +21,12 @@ benchmark:
     - ray
   output_dir: "results"
   input_path: "s3a://raw-data/events"
+  skewed_input_path: "s3a://raw-data/events-skewed"
   output_path: "s3a://processed-data/output"
   lookup_path: "s3a://raw-data/lookup/repo_metadata.parquet"
 
 spark:
-  master: "local[*]"
+  master: "local[4]"        # 4 cores, matching dask (2 workers x 2 threads) and ray (num_cpus: 4)
   app_name: "DistributedMind-Benchmark"
   # S3A settings injected at runtime via SparkConf
 
@@ -36,3 +38,19 @@ dask:
 ray:
   num_cpus: 4
   object_store_memory: 1073741824   # 1 GB
+
+skew:
+  amplify_top_n: 5          # repos replicated by data/amplify_skew.py
+  skew_factor: 10           # total copies of each hot-repo row
+  hot_key_top_n: 10         # repos the engines treat as hot when mitigating
+  salt_buckets: 8           # sub-keys per hot repo (Spark/Dask); Ray uses 2x as blocks
+
+fault_tolerance:
+  max_retries: 3
+  backoff_base_seconds: 0.5 # delay = min(max, base * 2^attempt)
+  backoff_max_seconds: 8.0
+
+observability:
+  # Batch jobs exit before Prometheus can scrape them, so metrics are pushed
+  # to a Pushgateway that Prometheus scrapes. Empty = don't push.
+  pushgateway: "${PUSHGATEWAY_URL:}"

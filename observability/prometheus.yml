@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # Benchmark runs are batch jobs that exit when the matrix finishes, so they
+  # push their metrics to the Pushgateway; Prometheus scrapes it from there.
+  # honor_labels keeps the job/engine labels the benchmark pushed.
+  - job_name: pushgateway
+    honor_labels: true
+    static_configs:
+      - targets: ["pushgateway:9091"]
+
+  # Optional: `python -m benchmark.runner --metrics-port 8000` also serves
+  # /metrics directly while a run is in progress.
+  - job_name: benchmark-live
+    static_configs:
+      - targets: ["benchmark:8000"]

@@ -22,7 +22,7 @@ distributedmind/
 │   └── metrics.py                  # MODIFIED: add Prometheus metrics
 ├── observability/
 │   ├── prometheus.yml              # NEW
-│   └── grafana/dashboard.json      # NEW
+│   └── grafana/                    # NEW: provisioning/ + dashboards/distributedmind.json
 ├── docker-compose.yml              # MODIFIED: add prometheus, grafana services
 └── tests/
     ├── test_fault_tolerance.py     # NEW
@@ -86,12 +86,12 @@ Full matrix: 3 engines × 2 datasets (balanced/skewed) × 2 modes (mitigated/unm
 - Don't break Phase 1 — existing tests (`test_engines.py`, `test_data_integrity.py`) must still pass
 
 ## Definition of Done (Phase 2)
-- [ ] `amplify_skew.py` produces a skewed dataset in MinIO with a logged before/after skew ratio
-- [ ] All 3 engines support `dataset_type` and `mitigate_skew` params with real, non-trivial mitigation logic
-- [ ] Fault injection + retry/recovery implemented and tested (`test_fault_tolerance.py` passes)
-- [ ] `test_skew.py` validates skewed dataset has expected distribution and mitigated runs reduce `skew_slowdown_ratio`
-- [ ] Full 12-run benchmark matrix executes and produces comparison table with `skew_slowdown_ratio`
-- [ ] Prometheus + Grafana running via `docker-compose up`, dashboard displays real data from a run
-- [ ] README updated: new architecture diagram, results table, mitigation/fault-tolerance/cost sections
-- [ ] CI extended to cover new tests on sample data, still green
-- [ ] Pushed to GitHub
+- [x] `amplify_skew.py` produces a skewed dataset in MinIO with a logged before/after skew ratio
+- [x] All 3 engines support `dataset_type` and `mitigate_skew` params with real, non-trivial mitigation logic
+- [x] Fault injection + retry/recovery implemented and tested (`test_fault_tolerance.py` passes)
+- [x] `test_skew.py` validates skewed dataset has expected distribution and mitigated runs reduce `skew_slowdown_ratio`
+- [x] Full 12-run benchmark matrix executes and produces comparison table with `skew_slowdown_ratio`
+- [x] Prometheus + Grafana running via `docker-compose up`, dashboard displays real data from a run
+- [x] README updated: new architecture diagram, results table, mitigation/fault-tolerance/cost sections
+- [x] CI extended to cover new tests on sample data, still green
+- [x] Pushed to GitHub

@@ -123,14 +123,14 @@ All three implement the exact same transformation from section 2. Code should be
 - No hardcoded paths/credentials — everything via `config/benchmark_config.yaml` and env vars (repo-metadata lookup table contents can be a static constant/file, that's fine)
 
 ## Definition of Done (Phase 1)
-- [ ] `docker-compose up` brings up MinIO + benchmark container successfully
-- [ ] Sample GH Archive data downloads, flattens, and lands in MinIO as Parquet
-- [ ] Repo-metadata lookup table generated and stored in MinIO
-- [ ] All 3 engines run the transformation and produce matching output
-- [ ] Benchmark runner produces a comparison table and JSON results file
-- [ ] CI passes on a clean clone (lint, type-check, tests, Docker build)
-- [ ] README has working setup instructions and a real results table
-- [ ] Repo pushed to GitHub, public, linkable from resume/portfolio
+- [x] `docker-compose up` brings up MinIO + benchmark container successfully
+- [x] Sample GH Archive data downloads, flattens, and lands in MinIO as Parquet
+- [x] Repo-metadata lookup table generated and stored in MinIO
+- [x] All 3 engines run the transformation and produce matching output
+- [x] Benchmark runner produces a comparison table and JSON results file
+- [x] CI passes on a clean clone (lint, type-check, tests, Docker build)
+- [x] README has working setup instructions and a real results table
+- [x] Repo pushed to GitHub, public, linkable from resume/portfolio
 
 ## Notes
 - Natural skew: even without Phase 2's amplification, GH Archive data will already show meaningful skew in event count and unique actors per repo (popular repos vs. long-tail). Worth a one-line callout in the Phase 1 README — sets up Phase 2 nicely.

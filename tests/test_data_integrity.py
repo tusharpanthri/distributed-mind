@@ -23,10 +23,10 @@ import pytest
 
 MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT", "")
 
-pytestmark = pytest.mark.skipif(
-    not MINIO_ENDPOINT,
-    reason="MINIO_ENDPOINT not set — skipping integration tests",
-)
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(not MINIO_ENDPOINT, reason="MINIO_ENDPOINT not set — skipping integration tests"),
+]
 
 
 # ---------------------------------------------------------------------------

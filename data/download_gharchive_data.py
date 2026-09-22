@@ -58,32 +58,33 @@ FLAT_SCHEMA = pa.schema(
 # Static repo-metadata lookup (hardcoded well-known repos)
 # ---------------------------------------------------------------------------
 
+# IDs, languages, and owner types taken from the GitHub REST API (/repos/{owner}/{name}).
 REPO_METADATA: list[dict] = [
-    {"repo_id": 1392255, "language": "Ruby", "repo_owner_type": "Organization"},       # rails/rails
-    {"repo_id": 28457823, "language": "Python", "repo_owner_type": "Organization"},    # django/django
-    {"repo_id": 83222441, "language": "TypeScript", "repo_owner_type": "Organization"},# microsoft/vscode
+    {"repo_id": 8514, "language": "Ruby", "repo_owner_type": "Organization"},          # rails/rails
+    {"repo_id": 4164482, "language": "Python", "repo_owner_type": "Organization"},     # django/django
+    {"repo_id": 41881900, "language": "TypeScript", "repo_owner_type": "Organization"},# microsoft/vscode
     {"repo_id": 10270250, "language": "JavaScript", "repo_owner_type": "Organization"},# facebook/react
-    {"repo_id": 8514, "language": "Python", "repo_owner_type": "User"},                # torvalds/linux
-    {"repo_id": 1217096, "language": "Go", "repo_owner_type": "Organization"},         # golang/go
-    {"repo_id": 2126244, "language": "Rust", "repo_owner_type": "Organization"},       # rust-lang/rust
-    {"repo_id": 54346799, "language": "Python", "repo_owner_type": "Organization"},    # tensorflow/tensorflow
+    {"repo_id": 2325298, "language": "C", "repo_owner_type": "User"},                  # torvalds/linux
+    {"repo_id": 23096959, "language": "Go", "repo_owner_type": "Organization"},        # golang/go
+    {"repo_id": 724712, "language": "Rust", "repo_owner_type": "Organization"},        # rust-lang/rust
+    {"repo_id": 45717250, "language": "C++", "repo_owner_type": "Organization"},       # tensorflow/tensorflow
     {"repo_id": 65600975, "language": "Python", "repo_owner_type": "Organization"},    # pytorch/pytorch
-    {"repo_id": 20580498, "language": "Java", "repo_owner_type": "Organization"},      # elastic/elasticsearch
-    {"repo_id": 507775, "language": "C", "repo_owner_type": "Organization"},           # git/git
-    {"repo_id": 1863329, "language": "JavaScript", "repo_owner_type": "Organization"}, # nodejs/node
-    {"repo_id": 13491895, "language": "Python", "repo_owner_type": "Organization"},    # ansible/ansible
-    {"repo_id": 41881900, "language": "Go", "repo_owner_type": "Organization"},        # kubernetes/kubernetes
-    {"repo_id": 20928900, "language": "Go", "repo_owner_type": "Organization"},        # docker/docker
-    {"repo_id": 6207190, "language": "Scala", "repo_owner_type": "Organization"},      # apache/spark
-    {"repo_id": 60246359, "language": "Python", "repo_owner_type": "Organization"},    # apache/airflow
-    {"repo_id": 7508411, "language": "Java", "repo_owner_type": "Organization"},       # apache/kafka
-    {"repo_id": 16563587, "language": "TypeScript", "repo_owner_type": "Organization"},# angular/angular
-    {"repo_id": 24195339, "language": "JavaScript", "repo_owner_type": "User"},        # vuejs/vue
-    {"repo_id": 10270341, "language": "Python", "repo_owner_type": "Organization"},    # scikit-learn/scikit-learn
-    {"repo_id": 3544424, "language": "Python", "repo_owner_type": "Organization"},     # numpy/numpy
-    {"repo_id": 6811994, "language": "Python", "repo_owner_type": "Organization"},     # pandas-dev/pandas
-    {"repo_id": 45717250, "language": "Python", "repo_owner_type": "Organization"},    # ray-project/ray
-    {"repo_id": 21351054, "language": "Python", "repo_owner_type": "Organization"},    # dask/dask
+    {"repo_id": 507775, "language": "Java", "repo_owner_type": "Organization"},        # elastic/elasticsearch
+    {"repo_id": 36502, "language": "C", "repo_owner_type": "Organization"},            # git/git
+    {"repo_id": 27193779, "language": "JavaScript", "repo_owner_type": "Organization"},# nodejs/node
+    {"repo_id": 3638964, "language": "Python", "repo_owner_type": "Organization"},     # ansible/ansible
+    {"repo_id": 20580498, "language": "Go", "repo_owner_type": "Organization"},        # kubernetes/kubernetes
+    {"repo_id": 7691631, "language": "Go", "repo_owner_type": "Organization"},         # moby/moby
+    {"repo_id": 17165658, "language": "Scala", "repo_owner_type": "Organization"},     # apache/spark
+    {"repo_id": 33884891, "language": "Python", "repo_owner_type": "Organization"},    # apache/airflow
+    {"repo_id": 2211243, "language": "Java", "repo_owner_type": "Organization"},       # apache/kafka
+    {"repo_id": 24195339, "language": "TypeScript", "repo_owner_type": "Organization"},# angular/angular
+    {"repo_id": 11730342, "language": "TypeScript", "repo_owner_type": "Organization"},# vuejs/vue
+    {"repo_id": 843222, "language": "Python", "repo_owner_type": "Organization"},      # scikit-learn/scikit-learn
+    {"repo_id": 908607, "language": "Python", "repo_owner_type": "Organization"},      # numpy/numpy
+    {"repo_id": 858127, "language": "Python", "repo_owner_type": "Organization"},      # pandas-dev/pandas
+    {"repo_id": 71932349, "language": "Python", "repo_owner_type": "Organization"},    # ray-project/ray
+    {"repo_id": 28782747, "language": "Python", "repo_owner_type": "Organization"},    # dask/dask
 ]
 
 REPO_METADATA_SCHEMA = pa.schema(
@@ -150,7 +151,7 @@ def _stream_hourly_file(url: str) -> Iterator[dict]:
     logger.info("Downloading", extra={"url": url})
     req = urllib.request.Request(url, headers={"User-Agent": "distributedmind-benchmark/1.0"})  # noqa: S310
     with urllib.request.urlopen(req, timeout=120) as response:  # noqa: S310
-        with gzip.GzipFile(fileobj=io.BytesIO(response.read())) as gz:
+        with gzip.GzipFile(fileobj=response) as gz:
             for line in gz:
                 line = line.strip()
                 if not line:
