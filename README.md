@@ -68,7 +68,7 @@ Even in Phase 1, GH Archive data exhibits real skew: popular repos (kubernetes, 
 ### 1. Clone and configure
 
 ```bash
-git clone https://github.com/<your-handle>/distributed-mind.git
+git clone https://github.com/tusharpanthri/distributed-mind.git
 cd distributed-mind
 cp .env.example .env   # edit if you want non-default MinIO credentials
 ```
@@ -113,15 +113,15 @@ python -m benchmark.runner --engines dask,ray
 
 ## Sample results
 
-*Run on a 2024 MacBook Pro M3, 16 GB RAM, 24-hour GH Archive sample (~720k rows after filtering to PushEvent).*
+*`docker compose up benchmark` on a Windows 11 desktop (Docker Desktop, 16 vCPU / 14 GB), CI sample: 1 hour of GH Archive (2024-01-15), 50k events → 48,087 PushEvents.*
 
 | Engine | Duration (s) | Rows/sec | Rows In | Rows Out | Mem (MB) | OK |
 |--------|-------------|----------|---------|----------|----------|----|
-| spark  | 38.4        | 18,750   | 720,441 | 1,284    | 512.3    | ✓  |
-| dask   | 22.1        | 32,600   | 720,441 | 1,284    | 310.7    | ✓  |
-| ray    | 19.8        | 36,385   | 720,441 | 1,284    | 287.1    | ✓  |
+| spark  | 6.69        | 7,183    | 48,087  | 14,757   | 434.6    | ✓  |
+| dask   | 2.81        | 17,137   | 48,087  | 14,757   | 205.1    | ✓  |
+| ray    | 3.80        | 12,641   | 48,087  | 14,757   | 713.1    | ✓  |
 
-> Numbers above are illustrative placeholders — replace with output from your actual run.
+All three engines produce identical output (14,757 repos) — asserted in CI by `tests/test_data_integrity.py`. At this size, fixed startup cost dominates: Spark pays for JVM + S3A init, Ray for its object store, which is why Dask leads. Memory includes child processes (Spark's JVM, Ray workers).
 
 ---
 
