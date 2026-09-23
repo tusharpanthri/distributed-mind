@@ -13,6 +13,9 @@ data:
   raw_prefix: "events"      # raw-data/events/date=YYYY-MM-DD/
   skewed_prefix: "events-skewed"  # raw-data/events-skewed/date=YYYY-MM-DD/ (amplify_skew.py)
   lookup_key: "lookup/repo_metadata.parquet"
+  # One Parquet file per date would be a single partition/block for every
+  # engine, capping parallelism (and OOM-ing a worker at 24h scale).
+  rows_per_file: 250000
 
 benchmark:
   engines:
@@ -25,19 +28,28 @@ benchmark:
   output_path: "s3a://processed-data/output"
   lookup_path: "s3a://raw-data/lookup/repo_metadata.parquet"
 
+# Engines run in local mode by default. The docker-compose.cluster.yml overlay
+# sets these env vars to point the driver at real Spark/Dask/Ray clusters.
 spark:
-  master: "local[4]"        # 4 cores, matching dask (2 workers x 2 threads) and ray (num_cpus: 4)
+  master: "${SPARK_MASTER_URL:local[4]}"   # local[4] matches dask (2x2) and ray (4)
   app_name: "DistributedMind-Benchmark"
   # S3A settings injected at runtime via SparkConf
 
 dask:
+  scheduler_address: "${DASK_SCHEDULER_ADDRESS:}"   # empty -> LocalCluster
   n_workers: 2
   threads_per_worker: 2
   memory_limit: "2GB"
 
 ray:
+  address: "${RAY_ADDRESS:}"                        # empty -> local ray.init()
   num_cpus: 4
   object_store_memory: 1073741824   # 1 GB
+
+cluster:
+  # Reporting labels only; the overlay and scripts/scaling_sweep.py set these.
+  workers: "${CLUSTER_WORKERS:0}"            # 0 = local mode
+  worker_cores: "${CLUSTER_WORKER_CORES:2}"
 
 skew:
   amplify_top_n: 5          # repos replicated by data/amplify_skew.py

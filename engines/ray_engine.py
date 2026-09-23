@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+import time
 from functools import partial
 from typing import Any
 
@@ -17,6 +19,23 @@ from engines.base import BenchmarkEngine, raise_injected_failure
 logger = logging.getLogger("distributedmind.ray")
 
 
+def _wait_for_cpus(timeout: float, poll: float = 2.0) -> None:
+    """Block until worker nodes offer CPUs.
+
+    The driver joins as a 0-CPU node, so without this a cluster whose workers
+    haven't registered (or have died) would queue tasks forever instead of
+    failing.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        cpus = ray.cluster_resources().get("CPU", 0)
+        if cpus >= 1:
+            logger.info("Ray cluster ready", extra={"cpus": cpus})
+            return
+        time.sleep(poll)
+    raise RuntimeError(f"no Ray worker CPUs registered within {timeout:.0f}s")
+
+
 class RayEngine(BenchmarkEngine):
     """Runs the benchmark transformation using Ray Data."""
 
@@ -25,6 +44,7 @@ class RayEngine(BenchmarkEngine):
     def __init__(self) -> None:
         super().__init__()
         self._fs: pafs.S3FileSystem | None = None
+        self._joined_cluster = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -35,13 +55,29 @@ class RayEngine(BenchmarkEngine):
         ray_cfg = config.get("ray", {})
         minio = config["minio"]
 
+        address = ray_cfg.get("address") or ""
         if not ray.is_initialized():
-            ray.init(
-                num_cpus=ray_cfg.get("num_cpus", 4),
-                object_store_memory=ray_cfg.get("object_store_memory", 1_073_741_824),
-                include_dashboard=False,
-                ignore_reinit_error=True,
-            )
+            if address:
+                # Ray Data needs a raylet on the driver's own node ("Global node
+                # is not initialized" under Ray Client), so the driver joins the
+                # cluster as a 0-CPU node and connects to it locally. All compute
+                # still happens on the ray-worker nodes.
+                started = subprocess.run(
+                    ["ray", "start", "--address", address, "--num-cpus=0", "--disable-usage-stats"],
+                    capture_output=True, text=True, timeout=180,
+                )
+                if started.returncode != 0:
+                    raise RuntimeError(f"ray start failed: {started.stderr.strip()[-500:]}")
+                self._joined_cluster = True
+                ray.init(address="auto", ignore_reinit_error=True)
+                _wait_for_cpus(timeout=120)
+            else:
+                ray.init(
+                    num_cpus=ray_cfg.get("num_cpus", 4),
+                    object_store_memory=ray_cfg.get("object_store_memory", 1_073_741_824),
+                    include_dashboard=False,
+                    ignore_reinit_error=True,
+                )
 
         endpoint = minio["endpoint"].replace("http://", "").replace("https://", "")
         self._fs = pafs.S3FileSystem(
@@ -50,12 +86,16 @@ class RayEngine(BenchmarkEngine):
             endpoint_override=endpoint,
             scheme="http",
         )
-        logger.info("Ray initialized")
+        logger.info("Ray initialized", extra={"address": address or "local"})
 
     def teardown(self) -> None:
         if ray.is_initialized():
             ray.shutdown()
             logger.info("Ray shutdown")
+        if self._joined_cluster:
+            # Detach this driver node; the head and workers stay up.
+            subprocess.run(["ray", "stop"], check=False, capture_output=True, timeout=120)
+            self._joined_cluster = False
         self._fs = None
 
     # ------------------------------------------------------------------
@@ -97,7 +137,7 @@ class RayEngine(BenchmarkEngine):
         # (~240s for 120k repos), so rows are hash-partitioned by key into a few
         # buckets instead: the shuffle is a cheap low-cardinality groupby on the
         # bucket id, and each bucket is aggregated with vectorized pandas.
-        num_buckets = 2 * int(self._config.get("ray", {}).get("num_cpus", 4))
+        num_buckets = 2 * self._available_cpus()
         if mitigate_skew:
             aggregated = self._aggregate_block_partitioned(dataset, num_buckets)
         else:
@@ -155,6 +195,12 @@ class RayEngine(BenchmarkEngine):
         combined = per_bucket.groupby(["repo_id", "repo_name"], as_index=False).sum(numeric_only=True)
         combined["avg_payload_size"] = combined["psum"] / combined["pcnt"].where(combined["pcnt"] > 0)
         return combined[["repo_id", "repo_name", "event_count", "unique_actors", "avg_payload_size"]]
+
+    def _available_cpus(self) -> int:
+        """CPUs the cluster actually has (local mode: the configured count)."""
+        if self._config.get("ray", {}).get("address"):
+            return max(1, int(ray.cluster_resources().get("CPU", 1)))
+        return int(self._config.get("ray", {}).get("num_cpus", 4))
 
     def _clear_prefix(self, path: str) -> None:
         """Remove a previous run's output so re-runs don't accumulate files."""

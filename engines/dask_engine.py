@@ -6,6 +6,7 @@ import logging
 from typing import Any
 from urllib.parse import urlparse
 
+import dask
 import dask.dataframe as dd
 import pandas as pd
 from dask.distributed import Client, LocalCluster
@@ -34,16 +35,26 @@ class DaskEngine(BenchmarkEngine):
     def setup(self, config: dict[str, Any]) -> None:
         self._config = config
         dask_cfg = config.get("dask", {})
+        address = dask_cfg.get("scheduler_address") or ""
 
-        self._cluster = LocalCluster(
-            n_workers=dask_cfg.get("n_workers", 2),
-            threads_per_worker=dask_cfg.get("threads_per_worker", 2),
-            memory_limit=dask_cfg.get("memory_limit", "2GB"),
-        )
-        self._client = Client(self._cluster)
-        logger.info("Dask LocalCluster created", extra={"dashboard": self._client.dashboard_link})
+        if address:
+            # Shared scheduler owned by docker-compose: connect, never create.
+            self._client = Client(address, timeout=60)
+            self._client.wait_for_workers(1, timeout=120)
+            logger.info("Dask cluster connected",
+                        extra={"address": address, "workers": len(self._client.scheduler_info()["workers"])})
+        else:
+            self._cluster = LocalCluster(
+                n_workers=dask_cfg.get("n_workers", 2),
+                threads_per_worker=dask_cfg.get("threads_per_worker", 2),
+                memory_limit=dask_cfg.get("memory_limit", "2GB"),
+            )
+            self._client = Client(self._cluster)
+            logger.info("Dask LocalCluster created", extra={"dashboard": self._client.dashboard_link})
 
     def teardown(self) -> None:
+        # Only the LocalCluster is ours to shut down; a shared scheduler
+        # outlives the run, so we just disconnect the client.
         if self._client:
             self._client.close()
             self._client = None
@@ -55,6 +66,15 @@ class DaskEngine(BenchmarkEngine):
     # ------------------------------------------------------------------
     # Transformation
     # ------------------------------------------------------------------
+
+    def _available_cores(self) -> int:
+        """Worker threads the cluster actually has (local mode: the configured count)."""
+        dask_cfg = self._config.get("dask", {})
+        if dask_cfg.get("scheduler_address") and self._client is not None:
+            workers = self._client.scheduler_info()["workers"]
+            if workers:
+                return sum(int(w["nthreads"]) for w in workers.values())
+        return int(dask_cfg.get("n_workers", 2)) * int(dask_cfg.get("threads_per_worker", 2))
 
     def _clear_output_prefix(self, output_path: str) -> None:
         """Delete existing objects under output_path via the MinIO SDK.
@@ -115,9 +135,14 @@ class DaskEngine(BenchmarkEngine):
         events = events.persist()
         rows_processed = int(len(events))
 
-        # 3. Group by repo_id / repo_name, compute aggregates
+        # 3. Group by repo_id / repo_name, compute aggregates.
+        # Both branches return pandas: the groupbys/shuffles run distributed,
+        # but their result is one row per repo, and merging two dask groupby
+        # results directly trips a dask-expr optimizer KeyError
+        # ("['repo_id' 'repo_name'] not in index") once the input spans several
+        # partitions. Ray's engine assembles its output the same way.
         if mitigate_skew:
-            aggregated = self._aggregate_repartitioned(events)
+            aggregated_pd = self._aggregate_repartitioned(events)
         else:
             # "nunique" isn't accepted inside groupby().agg() on this dask-expr
             # version, so it's computed as its own dedicated groupby call and merged.
@@ -135,11 +160,13 @@ class DaskEngine(BenchmarkEngine):
                 .rename("unique_actors")
                 .reset_index()
             )
-            aggregated = aggregated.merge(unique_actors, on=["repo_id", "repo_name"], how="left")
+            # One graph, so the filtered events are traversed once for both.
+            aggregated_pd, unique_pd = dask.compute(aggregated, unique_actors)
+            aggregated_pd = aggregated_pd.merge(unique_pd, on=["repo_id", "repo_name"], how="left")
 
         # 4. Join with repo-metadata lookup (left join → unknown for missing)
         lookup_pd: pd.DataFrame = dd.read_parquet(s3_lookup, storage_options=storage_options).compute()
-        enriched = aggregated.merge(lookup_pd, on="repo_id", how="left")
+        enriched = aggregated_pd.merge(lookup_pd, on="repo_id", how="left")
         enriched["language"] = enriched["language"].fillna("unknown")
         enriched["repo_owner_type"] = enriched["repo_owner_type"].fillna("unknown")
 
@@ -148,7 +175,7 @@ class DaskEngine(BenchmarkEngine):
         # write itself uses overwrite=False so dask never triggers s3fs's
         # bulk-delete path.
         self._clear_output_prefix(s3_output)
-        enriched.to_parquet(
+        dd.from_pandas(enriched, npartitions=max(1, self._available_cores())).to_parquet(
             s3_output,
             partition_on=["language"],
             storage_options=storage_options,
@@ -159,7 +186,7 @@ class DaskEngine(BenchmarkEngine):
         rows_output = int(len(enriched))
         return rows_processed, rows_output
 
-    def _aggregate_repartitioned(self, events: dd.DataFrame) -> dd.DataFrame:
+    def _aggregate_repartitioned(self, events: dd.DataFrame) -> pd.DataFrame:
         """Repartition informed by the key distribution before the groupby.
 
         Input is first rebalanced into evenly sized partitions (one big
@@ -172,8 +199,7 @@ class DaskEngine(BenchmarkEngine):
         skew_cfg = self._config.get("skew", {})
         top_n = int(skew_cfg.get("hot_key_top_n", 10))
         buckets = int(skew_cfg.get("salt_buckets", 8))
-        dask_cfg = self._config.get("dask", {})
-        n_parts = max(2, 2 * int(dask_cfg.get("n_workers", 2)) * int(dask_cfg.get("threads_per_worker", 2)))
+        n_parts = max(2, 2 * self._available_cores())
 
         hot_ids = set(events["repo_id"].value_counts().nlargest(top_n).index.compute().tolist())
         events = events.repartition(npartitions=n_parts)
@@ -209,7 +235,8 @@ class DaskEngine(BenchmarkEngine):
             .rename("unique_actors")
             .reset_index()
         )
-        return additive.merge(distinct_actors, on=["repo_id", "repo_name"], how="left")
+        additive_pd, distinct_pd = dask.compute(additive, distinct_actors)
+        return additive_pd.merge(distinct_pd, on=["repo_id", "repo_name"], how="left")
 
 
 def _add_salt(part: pd.DataFrame, hot_ids: set[int], buckets: int) -> pd.DataFrame:

@@ -1,6 +1,6 @@
 # DistributedMind
 
-A benchmark framework that runs the **same data transformation workload** on PySpark, Dask, and Ray, side by side. It uses real GitHub Archive event data stored in MinIO (S3-compatible, so there's no cloud cost). It then measures how each engine slows down under **data skew**, what **skew mitigation** buys, and how each **recovers from worker failures**. Everything is observable in **Prometheus + Grafana**.
+A benchmark framework that runs the **same data transformation workload** on PySpark, Dask, and Ray, side by side. It uses real GitHub Archive event data stored in MinIO (S3-compatible, so there's no cloud cost). It then measures how each engine slows down under **data skew**, what **skew mitigation** buys, how each **recovers from worker failures**, and how each **scales across a real multi-node cluster**. Everything is observable in **Prometheus + Grafana**.
 
 [![CI](https://github.com/tusharpanthri/distributed-mind/actions/workflows/ci.yml/badge.svg)](https://github.com/tusharpanthri/distributed-mind/actions/workflows/ci.yml)
 
@@ -10,13 +10,14 @@ A benchmark framework that runs the **same data transformation workload** on PyS
 
 | Area | Technologies |
 |---|---|
-| Distributed engines | **Apache Spark** (PySpark 3.5, local mode, S3A connector), **Dask** (dask-expr DataFrame on a `distributed` LocalCluster), **Ray Data** 2.20 |
+| Distributed engines | **Apache Spark** (PySpark 3.5, S3A connector), **Dask** (dask-expr DataFrame), **Ray Data** 2.20 |
+| Cluster modes | Local (single process) **and multi-node**: Spark **standalone** master + workers, Dask **scheduler + workers**, Ray **head + workers** — each containerized, worker count scaled with Compose |
 | Storage & formats | **MinIO** (S3-compatible object store), **Apache Parquet**, **Apache Arrow** (pyarrow, including its S3 filesystem), **s3fs**, MinIO Python SDK |
 | Data | **GH Archive** hourly GitHub event dumps (gzipped JSON), flattened to a fixed schema |
 | Data processing | **pandas**, NumPy |
 | Observability | **Prometheus**, **Prometheus Pushgateway**, **Grafana** (auto-provisioned dashboard), `prometheus-client`, structured JSON logging (`python-json-logger`), `psutil` memory tracking |
-| Containers | **Docker** (multi-stage image with Java 17 for Spark), **Docker Compose** (MinIO, benchmark, Pushgateway, Prometheus, Grafana) |
-| CI/CD | **GitHub Actions**: lint, type-check, unit tests, integration tests against a live MinIO, Docker build |
+| Containers | **Docker** (multi-stage image with Java 17 for Spark), **Docker Compose** (MinIO, benchmark, Pushgateway, Prometheus, Grafana, plus a cluster overlay) |
+| CI/CD | **GitHub Actions**: lint, type-check, unit tests, integration tests against a live MinIO, a multi-node cluster smoke test, Docker build |
 | Code quality & testing | **pytest** (+ pytest-timeout), **ruff**, **mypy**, type hints throughout |
 | Language & CLI | **Python 3.11**, `click` CLIs, YAML config with `${ENV:default}` substitution |
 
@@ -117,6 +118,26 @@ python -m benchmark.runner --engines dask,ray --datasets balanced,skewed --mitig
 
 For fast iteration, a smaller sample works too: `--hours 1 --sample-size 50000`, which is what CI uses.
 
+### Multi-node clusters
+
+Everything above runs in local mode. The `docker-compose.cluster.yml` overlay swaps that for real clusters — Spark standalone, a Dask scheduler, and a Ray head, each with scalable worker containers — and points the benchmark driver at them:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cluster.yml up -d --scale spark-worker=2 --scale dask-worker=2 --scale ray-worker=2
+```
+
+```bash
+CLUSTER_WORKERS=2 docker compose -f docker-compose.yml -f docker-compose.cluster.yml run --rm benchmark -m benchmark.runner --cluster-workers 2
+```
+
+To sweep the worker count and report speedup and efficiency (this brings up only the engine under test at each step, so a laptop never hosts three clusters at once):
+
+```bash
+python scripts/scaling_sweep.py --workers 1,2,4 --datasets balanced,skewed
+```
+
+The Spark master UI is at http://localhost:8080 and the Dask dashboard at http://localhost:8787.
+
 ---
 
 ## Results
@@ -155,6 +176,47 @@ The whole 12-run matrix (36 timed runs plus warmups) takes **3m39s**.
 - **Fixed overhead dominates at this size.** At a few seconds per job, scheduling and I/O setup are a large share of the runtime. That's why Dask, the lightest-weight scheduler here, leads on raw duration. The ranking can change at larger scale.
 
 > **Ray Data implementation note.** Ray 2.20's built-in `groupby().aggregate()` and `map_groups` iterate over groups in Python. With 120k repo keys that took **240 s** (built-in aggregations) or **65 s** (`map_groups`) for the balanced dataset. The engine therefore hash-partitions rows into `2 × num_cpus` buckets, groups on the low-cardinality bucket id, and aggregates each bucket with vectorized pandas: **4.0 s**.
+
+---
+
+## Scaling (multi-node)
+
+Local mode can only tell you which engine is fastest on one box. This section runs the **same workload against real clusters** — Spark standalone, a Dask scheduler, and a Ray head, each with worker containers — and sweeps the worker count to see how much of each extra worker actually becomes throughput.
+
+Measured with `python scripts/scaling_sweep.py --workers 1,2,4 --datasets balanced,skewed`, on a full **24h GH Archive day** (3,682,194 PushEvents balanced / 6,240,579 skewed, over 572,369 repos). Every worker gets an identical budget of **2 cores and 2 GB**, so 4 workers = 8 cores. Mitigation is off throughout. The whole sweep (18 runs) takes **17m22s**.
+
+| Engine | Dataset | Workers | Cores | Duration (s) | Rows/sec | Speedup | Efficiency |
+|---|---|---:|---:|---:|---:|---:|---:|
+| spark | balanced | 1 | 2 | 12.80 | 287,627 | 1.00× | 100% |
+| spark | balanced | 2 | 4 | 11.37 | 323,789 | 1.13× | 56% |
+| spark | balanced | 4 | 8 | 10.62 | 346,794 | **1.21×** | **30%** |
+| spark | skewed | 1 | 2 | 14.29 | 436,705 | 1.00× | 100% |
+| spark | skewed | 2 | 4 | 10.29 | 606,486 | 1.39× | 69% |
+| spark | skewed | 4 | 8 | 11.74 | 531,552 | **1.22×** | **30%** |
+| dask | balanced | 1 | 2 | 14.61 | 252,051 | 1.00× | 100% |
+| dask | balanced | 2 | 4 | 10.20 | 360,858 | 1.43× | 72% |
+| dask | balanced | 4 | 8 | 8.18 | 450,134 | **1.79×** | **45%** |
+| dask | skewed | 1 | 2 | 18.95 | 329,268 | 1.00× | 100% |
+| dask | skewed | 2 | 4 | 12.65 | 493,286 | 1.50× | 75% |
+| dask | skewed | 4 | 8 | 9.88 | 631,405 | **1.92×** | **48%** |
+| ray | balanced | 1 | 2 | 59.35 | 62,045 | 1.00× | 100% |
+| ray | balanced | 2 | 4 | 37.68 | 97,730 | 1.58× | 79% |
+| ray | balanced | 4 | 8 | 24.75 | 148,746 | **2.40×** | **60%** |
+| ray | skewed | 1 | 2 | 89.68 | 69,589 | 1.00× | 100% |
+| ray | skewed | 2 | 4 | 53.80 | 116,006 | 1.67× | 83% |
+| ray | skewed | 4 | 8 | 40.31 | 154,798 | **2.22×** | **56%** |
+
+*Speedup* is the 1-worker duration ÷ this duration. *Efficiency* is speedup ÷ the worker-count factor: 100% would be perfectly linear, 50% means half of each added worker is wasted. All 18 runs produced the same 572,369 output rows.
+
+**What the numbers say**
+
+- **Nobody scales linearly, and the ranking flips depending on what you ask.** Dask is fastest in absolute terms at every worker count (8.18s on 4 workers). Ray is the slowest but scales best (2.40×, 60% efficiency). Spark barely benefits from more workers at all (1.21×, 30%).
+- **Ray scales best because it has the most work to parallelize.** Its per-row Python processing is CPU-bound, and CPU-bound work is exactly what extra cores absorb. Spark and Dask push the same aggregation into vectorized/JVM code, so they start near the floor set by I/O and coordination and have less left to win.
+- **Spark's fixed overhead dominates at this size.** A ~12s job spends a large share on job setup, S3A listing, and shuffle scaffolding, none of which shrinks when workers are added. Spark's skewed run at 4 workers (11.74s) is actually *slower* than at 2 (10.29s) — past a point, more executors mean more shuffle partitions and more coordination for the same work.
+- **Efficiency decays the same way for everyone**, which is Amdahl's law showing up: each job has a serial tail (driver-side assembly of the ~572k-row result, the lookup join, and the write) that no number of workers can shrink. That tail is why even Ray lands at 60% rather than near 100%.
+- **Skew doesn't change the scaling story.** Speedup curves for balanced and skewed data are close for all three engines, which is consistent with the Phase 2 finding that key skew is mostly absorbed by map-side partial aggregation.
+
+**Caveats worth stating.** These are single-host containers, so "network" between workers is loopback — real multi-machine clusters pay more for shuffles, which would likely lower efficiency further. Each configuration was run once (`--repeats 1`); the ±1s of run-to-run noise doesn't change any of the conclusions above, but it does explain small non-monotonic wobbles like Spark's skewed 2→4 worker result.
 
 ---
 
@@ -271,15 +333,18 @@ GitHub Actions on every push/PR:
 1. `ruff check .` and `mypy`
 2. Unit tests
 3. Integration tests: starts MinIO, ingests a 50k-row sample, builds the skewed dataset, runs every integration test
-4. `docker compose config` validation and a Docker image build
+4. Cluster smoke: brings up all three clusters with one worker each and runs a job per engine against them, asserting matching row counts. Because the engines fail fast when no worker registers, this genuinely proves each driver reached its scheduler
+5. `docker compose config` validation and a Docker image build
 
 ## Project layout
 
 ```
-benchmark/     runner (matrix, CLI), metrics (timing, memory, Prometheus), results writer
+benchmark/     runner (matrix, CLI), metrics (timing, memory, Prometheus), scaling maths, results writer
 engines/       base (retry/backoff, failure injection), spark_engine, dask_engine, ray_engine
 data/          download_gharchive_data (ingest + flatten), amplify_skew
+scripts/       scaling_sweep.py (worker-count sweep, host-side)
 observability/ prometheus.yml, Grafana provisioning + dashboard
-tests/         test_engines, test_data_integrity, test_skew, test_fault_tolerance
+tests/         test_engines, test_data_integrity, test_skew, test_fault_tolerance, test_scaling
 config/        benchmark_config.yaml
+docker-compose.yml + docker-compose.cluster.yml (multi-node overlay)
 ```

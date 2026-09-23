@@ -39,6 +39,8 @@ class BenchmarkResult:
     mitigation_applied: bool = False
     retry_count: int = 0
     recovery_time_seconds: float = 0.0
+    worker_count: int = 0       # 0 = local mode (single process)
+    total_cores: int = 0
 
     @property
     def rows_per_second(self) -> float:
@@ -137,6 +139,10 @@ class BenchmarkEngine(ABC):
         if success and first_failure_at is not None:
             recovery = time.perf_counter() - first_failure_at
 
+        cluster = self._config.get("cluster", {})
+        workers = int(cluster.get("workers", 0) or 0)
+        cores = int(cluster.get("worker_cores", 0) or 0)
+
         return BenchmarkResult(
             engine_name=self.name,
             duration_seconds=metrics.duration_seconds,
@@ -149,6 +155,8 @@ class BenchmarkEngine(ABC):
             mitigation_applied=mitigate_skew,
             retry_count=retry_count,
             recovery_time_seconds=recovery,
+            worker_count=workers,
+            total_cores=workers * cores,
         )
 
     def __enter__(self) -> "BenchmarkEngine":

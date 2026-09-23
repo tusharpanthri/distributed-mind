@@ -45,6 +45,7 @@ services:
   # Benchmark — runs the full pipeline
   # ---------------------------------------------------------------------------
   benchmark:
+    image: distributed-mind-benchmark:latest
     build:
       context: .
       dockerfile: Dockerfile

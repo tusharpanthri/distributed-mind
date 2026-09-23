@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import socket
+import time
 from typing import Any
 
 from pyspark.sql import DataFrame, SparkSession
@@ -32,10 +34,11 @@ class SparkEngine(BenchmarkEngine):
         minio = config["minio"]
         spark_cfg = config.get("spark", {})
         endpoint = minio["endpoint"]
+        master = spark_cfg.get("master") or "local[*]"
 
-        self._spark = (
+        builder = (
             SparkSession.builder.appName(spark_cfg.get("app_name", "DistributedMind"))
-            .master(spark_cfg.get("master", "local[*]"))
+            .master(master)
             .config("spark.hadoop.fs.s3a.endpoint", endpoint)
             .config("spark.hadoop.fs.s3a.access.key", minio["access_key"])
             .config("spark.hadoop.fs.s3a.secret.key", minio["secret_key"])
@@ -47,10 +50,44 @@ class SparkEngine(BenchmarkEngine):
                     "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262")
             .config("spark.ui.enabled", "false")
             .config("spark.sql.shuffle.partitions", "8")
-            .getOrCreate()
         )
+
+        if not master.startswith("local"):
+            # Standalone cluster: executors dial back to this driver, so the
+            # driver advertises its container hostname (Docker DNS resolves it)
+            # on fixed ports rather than a random one.
+            cluster = self._config.get("cluster", {})
+            cores = int(cluster.get("worker_cores", 2)) * max(1, int(cluster.get("workers", 1)))
+            builder = (
+                builder.config("spark.driver.host", socket.gethostname())
+                .config("spark.driver.port", "7078")
+                .config("spark.blockManager.port", "7079")
+                .config("spark.cores.max", str(cores))
+                .config("spark.sql.shuffle.partitions", str(max(8, 2 * cores)))
+                .config("spark.executor.memory", spark_cfg.get("executor_memory", "1500m"))
+            )
+
+        self._spark = builder.getOrCreate()
         self._spark.sparkContext.setLogLevel("WARN")
-        logger.info("Spark session created")
+        if not master.startswith("local"):
+            self._wait_for_executors(timeout=120)
+        logger.info("Spark session created", extra={"master": master})
+
+    def _wait_for_executors(self, timeout: float, poll: float = 2.0) -> None:
+        """Block until at least one executor registers, else fail fast.
+
+        A standalone job submitted to a master with no live workers would
+        otherwise sit in the queue indefinitely.
+        """
+        assert self._spark is not None
+        sc = self._spark.sparkContext._jsc.sc()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            # The map includes the driver, so >1 means a real executor registered.
+            if sc.getExecutorMemoryStatus().size() > 1:
+                return
+            time.sleep(poll)
+        raise RuntimeError(f"no Spark executors registered within {timeout:.0f}s")
 
     def teardown(self) -> None:
         if self._spark:

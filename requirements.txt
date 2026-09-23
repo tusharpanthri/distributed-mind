@@ -2,7 +2,7 @@
 pyspark==3.5.1
 dask[dataframe,distributed]==2024.5.0
 distributed==2024.5.0
-ray[data]==2.20.0
+ray[data,client]==2.20.0   # client extra: driver connects to a remote head via ray://
 pyarrow==16.1.0
 pandas==2.2.2
 # ray 2.20's sort-based groupby calls np.quantile(interpolation=...), removed in NumPy 2

@@ -124,6 +124,58 @@ jobs:
       - name: Run integration tests (data integrity, skew mitigation, fault tolerance)
         run: pytest -m integration -v --timeout=600
 
+  cluster-smoke:
+    name: Cluster Smoke (Spark/Dask/Ray multi-node)
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    timeout-minutes: 30
+
+    env:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      CLUSTER_WORKERS: "1"
+      CLUSTER_WORKER_CORES: "2"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build benchmark image
+        run: docker compose build benchmark
+
+      - name: Start MinIO and the three clusters
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.cluster.yml up -d             minio minio-init spark-master spark-worker dask-scheduler dask-worker ray-head ray-worker
+
+      - name: Ingest sample data
+        run: |
+          docker compose run --rm benchmark -m data.download_gharchive_data             --date 2024-01-15 --hours 1 --sample-size 50000
+
+      # Engines fail fast if no worker registers, so this asserts the drivers
+      # really reached the Spark master / Dask scheduler / Ray head.
+      - name: Run one job per engine against the clusters
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.cluster.yml run --rm benchmark             -m benchmark.runner --engines spark,dask,ray             --datasets balanced --mitigation off --no-warmup             --cluster-workers 1 --output results/cluster_smoke.json
+
+      - name: Assert every engine succeeded with matching row counts
+        run: |
+          python - <<'PY'
+          import json
+          results = json.load(open("results/cluster_smoke.json"))["results"]
+          assert len(results) == 3, results
+          for r in results:
+              assert r["success"], (r["engine_name"], r["error_message"])
+              assert r["worker_count"] == 1, r
+          outputs = {r["engine_name"]: r["rows_output"] for r in results}
+          assert len(set(outputs.values())) == 1, outputs
+          print("cluster smoke OK:", outputs)
+          PY
+
+      - name: Cluster logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.yml -f docker-compose.cluster.yml logs             --tail 100 spark-master spark-worker dask-scheduler dask-worker ray-head ray-worker
+
   docker-build:
     name: Docker Build
     runs-on: ubuntu-latest

@@ -185,6 +185,24 @@ def _ensure_bucket(client: Minio, bucket: str) -> None:
         logger.info("Created bucket", extra={"bucket": bucket})
 
 
+def _clear_prefix(client: Minio, bucket: str, prefix: str) -> None:
+    """Drop a date partition's existing files so a re-ingest replaces it.
+
+    Without this, re-running with a different rows_per_file (or fewer hours)
+    would leave stale objects behind and double-count events.
+    """
+    from minio.deleteobjects import DeleteObject
+
+    if not client.bucket_exists(bucket):
+        return
+    stale = [DeleteObject(o.object_name) for o in client.list_objects(bucket, prefix=prefix, recursive=True)]
+    if not stale:
+        return
+    for error in client.remove_objects(bucket, stale):
+        logger.warning("Failed to delete stale object", extra={"error": str(error)})
+    logger.info("Cleared existing partition", extra={"bucket": bucket, "prefix": prefix, "objects": len(stale)})
+
+
 def _upload_parquet(client: Minio, bucket: str, key: str, table: pa.Table) -> None:
     buf = io.BytesIO()
     pq.write_table(table, buf, compression="snappy")
@@ -260,12 +278,17 @@ def ingest(
         hour_idx += 1
         logger.info("Hour processed", extra={"hour": hour_idx, "total_rows": total_rows})
 
-    # Write one Parquet file per date partition
+    # Write each date partition as several row-bounded Parquet files so every
+    # engine gets multiple partitions to work on.
     raw_prefix = cfg["data"]["raw_prefix"]
+    rows_per_file = int(cfg["data"].get("rows_per_file", 250_000)) or 250_000
     for event_date, rows in records_by_date.items():
         table = pa.Table.from_pylist(rows, schema=FLAT_SCHEMA)
-        key = f"{raw_prefix}/date={event_date}/events.parquet"
-        _upload_parquet(client, raw_bucket, key, table)
+        _clear_prefix(client, raw_bucket, f"{raw_prefix}/date={event_date}/")
+        for part, offset in enumerate(range(0, table.num_rows, rows_per_file)):
+            chunk = table.slice(offset, rows_per_file)
+            key = f"{raw_prefix}/date={event_date}/events-{part:04d}.parquet"
+            _upload_parquet(client, raw_bucket, key, chunk)
 
     # Write repo-metadata lookup
     lookup_table = pa.Table.from_pylist(REPO_METADATA, schema=REPO_METADATA_SCHEMA)

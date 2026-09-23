@@ -90,6 +90,7 @@ def run(config_path: str, top_n: int, skew_factor: int) -> tuple[SkewStats, Skew
     cfg = _load_config(config_path)
     fs = _filesystem(cfg)
     bucket = cfg["minio"]["bucket_raw"]
+    rows_per_file = int(cfg["data"].get("rows_per_file", 250_000)) or 250_000
     src = f"{bucket}/{cfg['data']['raw_prefix']}"
     dst = f"{bucket}/{cfg['data']['skewed_prefix']}"
 
@@ -107,7 +108,10 @@ def run(config_path: str, top_n: int, skew_factor: int) -> tuple[SkewStats, Skew
     for date in dates:
         part = table.filter(pc.equal(source.column("date").cast(pa.string()), date))
         skewed_part = amplify(part, hot_ids, skew_factor)
-        pq.write_table(skewed_part, f"{dst}/date={date}/events.parquet", filesystem=fs, compression="snappy")
+        for idx, offset in enumerate(range(0, skewed_part.num_rows, rows_per_file)):
+            pq.write_table(skewed_part.slice(offset, rows_per_file),
+                           f"{dst}/date={date}/events-{idx:04d}.parquet",
+                           filesystem=fs, compression="snappy")
         skewed_parts.append(skewed_part)
     after = skew_stats(push_events(pa.concat_tables(skewed_parts)), top_n)
 

@@ -87,7 +87,7 @@ def skew_slowdown_ratios(results: list[BenchmarkResult]) -> dict[tuple[str, bool
 
 def _print_table(results: list[BenchmarkResult], ratios: dict[tuple[str, bool], float]) -> None:
     header = (
-        f"{'Engine':<7} {'Dataset':<9} {'Mitig.':<6} {'Duration (s)':>12} {'Rows/sec':>10} "
+        f"{'Engine':<7} {'Dataset':<9} {'Mitig.':<6} {'Wrk':>4} {'Duration (s)':>12} {'Rows/sec':>10} "
         f"{'Rows In':>9} {'Rows Out':>9} {'Mem (MB)':>9} {'Skew x':>7} {'Retries':>7} {'Recov (s)':>9} {'OK':>4}"
     )
     print("\n" + "=" * len(header))
@@ -102,6 +102,7 @@ def _print_table(results: list[BenchmarkResult], ratios: dict[tuple[str, bool], 
             f"{r.engine_name:<7} "
             f"{r.dataset_type:<9} "
             f"{'on' if r.mitigation_applied else 'off':<6} "
+            f"{(r.worker_count or '-'):>4} "
             f"{r.duration_seconds:>12.2f} "
             f"{rps:>10} "
             f"{r.rows_processed:>9,} "
@@ -238,6 +239,8 @@ def _parse_list(value: str, allowed: dict[str, Any]) -> list[Any]:
               help="Untimed run per engine before measuring")
 @click.option("--simulate-failure", is_flag=True,
               help="Inject a worker-task failure into each skewed run to exercise retry/recovery")
+@click.option("--cluster-workers", default=None, type=int,
+              help="Worker count to record on results (default: cluster.workers from config)")
 @click.option("--metrics-port", default=0, show_default=True,
               help="Also serve /metrics on this port while running (0 = off)")
 @click.option(
@@ -258,6 +261,7 @@ def main(
     repeats: int,
     warmup: bool,
     simulate_failure: bool,
+    cluster_workers: int | None,
     metrics_port: int,
     output: str | None,
     config_path: str,
@@ -265,6 +269,8 @@ def main(
     """Run the distributed benchmark matrix across selected engines."""
     _setup_logging()
     config = _load_config(config_path)
+    if cluster_workers is not None:
+        config.setdefault("cluster", {})["workers"] = cluster_workers
 
     if output is None:
         ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")

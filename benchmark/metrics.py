@@ -12,6 +12,7 @@ import psutil
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, push_to_gateway, start_http_server
 
 if TYPE_CHECKING:
+    from benchmark.scaling import ScalingPoint
     from engines.base import BenchmarkResult
 
 
@@ -81,7 +82,7 @@ class PrometheusRecorder:
 
     def __init__(self) -> None:
         self.registry = CollectorRegistry()
-        labels = ["engine", "dataset_type", "mitigation"]
+        labels = ["engine", "dataset_type", "mitigation", "workers"]
         self.job_duration = Histogram(
             "job_duration_seconds", "Wall-clock duration of one benchmark job",
             labels, buckets=_DURATION_BUCKETS, registry=self.registry,
@@ -104,7 +105,7 @@ class PrometheusRecorder:
         )
         self.recovery_time = Histogram(
             "recovery_time_seconds", "Time from first failure to successful completion",
-            ["engine", "dataset_type", "mitigation"], buckets=_DURATION_BUCKETS, registry=self.registry,
+            labels, buckets=_DURATION_BUCKETS, registry=self.registry,
         )
         self.last_recovery_time = Gauge(
             "last_recovery_time_seconds", "Recovery time of the most recent recovered job",
@@ -113,6 +114,14 @@ class PrometheusRecorder:
         self.skew_slowdown = Gauge(
             "skew_slowdown_ratio", "Skewed duration / balanced duration for the same engine and mitigation",
             ["engine", "mitigation"], registry=self.registry,
+        )
+        self.speedup = Gauge(
+            "cluster_speedup_ratio", "Duration at the baseline worker count / duration at this one",
+            ["engine", "dataset_type", "workers"], registry=self.registry,
+        )
+        self.efficiency = Gauge(
+            "parallel_efficiency_ratio", "Speedup / worker-count factor; 1.0 is linear scaling",
+            ["engine", "dataset_type", "workers"], registry=self.registry,
         )
         self.last_run_timestamp = Gauge(
             "benchmark_last_run_timestamp_seconds", "Unix time the last matrix finished",
@@ -124,6 +133,7 @@ class PrometheusRecorder:
             "engine": result.engine_name,
             "dataset_type": result.dataset_type,
             "mitigation": "on" if result.mitigation_applied else "off",
+            "workers": str(result.worker_count or "local"),
         }
         if result.retry_count:
             self.job_retries.labels(**labels).inc(result.retry_count)
@@ -139,6 +149,12 @@ class PrometheusRecorder:
 
     def set_skew_slowdown(self, engine: str, mitigation: bool, ratio: float) -> None:
         self.skew_slowdown.labels(engine=engine, mitigation="on" if mitigation else "off").set(ratio)
+
+    def record_scaling(self, point: "ScalingPoint") -> None:
+        labels = {"engine": point.engine_name, "dataset_type": point.dataset_type,
+                  "workers": str(point.worker_count)}
+        self.speedup.labels(**labels).set(point.speedup)
+        self.efficiency.labels(**labels).set(point.parallel_efficiency)
 
     def serve(self, port: int) -> None:
         start_http_server(port, registry=self.registry)

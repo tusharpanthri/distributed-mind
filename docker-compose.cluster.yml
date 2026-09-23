@@ -1,0 +1,132 @@
+# Multi-node overlay: real Spark / Dask / Ray clusters instead of local mode.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cluster.yml \
+#     up -d --scale spark-worker=2 --scale dask-worker=2 --scale ray-worker=2
+#
+# Every service reuses the benchmark image (it already ships PySpark's
+# spark-class, the dask CLI and ray), overriding the entrypoint. Each worker
+# gets the same budget — 2 cores / 2 GB — so engines stay comparable, and
+# scripts/scaling_sweep.py varies only the worker count.
+
+x-worker-resources: &worker-resources
+  cpus: 2.0
+  mem_limit: 2g
+  # Workers exit when their scheduler/head restarts (e.g. after a rebuild);
+  # restarting lets them rejoin instead of leaving an empty cluster behind.
+  restart: unless-stopped
+
+services:
+  # ---------------------------------------------------------------------------
+  # Spark standalone
+  # ---------------------------------------------------------------------------
+  spark-master:
+    image: distributed-mind-benchmark:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/usr/local/lib/python3.11/site-packages/pyspark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.master.Master", "--host", "spark-master", "--port", "7077"]
+    ports:
+      - "8080:8080"   # master UI
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  spark-worker:
+    image: distributed-mind-benchmark:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/usr/local/lib/python3.11/site-packages/pyspark/bin/spark-class"]
+    command: ["org.apache.spark.deploy.worker.Worker", "spark://spark-master:7077",
+              "--cores", "${CLUSTER_WORKER_CORES:-2}", "--memory", "2g"]
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    <<: *worker-resources
+
+  # ---------------------------------------------------------------------------
+  # Dask
+  # ---------------------------------------------------------------------------
+  dask-scheduler:
+    image: distributed-mind-benchmark:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["dask"]
+    command: ["scheduler", "--host", "0.0.0.0", "--port", "8786", "--dashboard-address", ":8787"]
+    ports:
+      - "8787:8787"   # dask dashboard
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8787/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  dask-worker:
+    image: distributed-mind-benchmark:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["dask"]
+    command: ["worker", "tcp://dask-scheduler:8786",
+              "--nworkers", "1", "--nthreads", "${CLUSTER_WORKER_CORES:-2}", "--memory-limit", "2GB"]
+    depends_on:
+      dask-scheduler:
+        condition: service_healthy
+    <<: *worker-resources
+
+  # ---------------------------------------------------------------------------
+  # Ray — head holds no CPUs so only workers execute tasks
+  # ---------------------------------------------------------------------------
+  ray-head:
+    image: distributed-mind-benchmark:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["ray"]
+    command: ["start", "--head", "--node-ip-address=ray-head", "--port=6379",
+              "--ray-client-server-port=10001", "--num-cpus=0",
+              "--include-dashboard=false", "--disable-usage-stats", "--block"]
+    shm_size: "1gb"
+    healthcheck:
+      test: ["CMD", "bash", "-c", "ray status --address ray-head:6379 >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ray-worker:
+    image: distributed-mind-benchmark:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["ray"]
+    command: ["start", "--address=ray-head:6379", "--num-cpus=${CLUSTER_WORKER_CORES:-2}",
+              "--object-store-memory=536870912", "--disable-usage-stats", "--block"]
+    depends_on:
+      ray-head:
+        condition: service_healthy
+    shm_size: "1gb"
+    <<: *worker-resources
+
+  # ---------------------------------------------------------------------------
+  # Benchmark driver — same image, now pointed at the clusters
+  # ---------------------------------------------------------------------------
+  benchmark:
+    environment:
+      SPARK_MASTER_URL: spark://spark-master:7077
+      DASK_SCHEDULER_ADDRESS: tcp://dask-scheduler:8786
+      # GCS address (not ray://): the driver joins the cluster as a 0-CPU node,
+      # because Ray Data needs a raylet on the driver's node.
+      RAY_ADDRESS: ray-head:6379
+      CLUSTER_WORKERS: "${CLUSTER_WORKERS:-1}"
+      CLUSTER_WORKER_CORES: "${CLUSTER_WORKER_CORES:-2}"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      dask-scheduler:
+        condition: service_healthy
+      ray-head:
+        condition: service_healthy
