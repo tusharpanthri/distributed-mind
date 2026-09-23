@@ -183,40 +183,40 @@ The whole 12-run matrix (36 timed runs plus warmups) takes **13m17s**.
 
 Local mode can only tell you which engine is fastest on one box. This section runs the **same workload against real clusters** — Spark standalone, a Dask scheduler, and a Ray head, each with worker containers — and sweeps the worker count to see how much of each extra worker actually becomes throughput.
 
-Measured with `python scripts/scaling_sweep.py --workers 1,2,4 --datasets balanced,skewed`, on a full **24h GH Archive day** (3,682,194 PushEvents balanced / 6,240,579 skewed, over 572,369 repos). Every worker gets an identical budget of **2 cores and 2 GB**, so 4 workers = 8 cores. Mitigation is off throughout. The whole sweep (18 runs) takes **17m22s**.
+Measured with `python scripts/scaling_sweep.py --workers 1,2,4 --datasets balanced,skewed --repeats 3`, on the same 24h day (3,682,194 PushEvents balanced / 6,240,579 skewed, 572,369 repos). Every worker gets an identical budget of **2 cores and 2 GB**, so 4 workers = 8 cores; each configuration reports the **median of 3 runs**. Mitigation is off throughout. The sweep (54 timed runs) takes **39m21s**.
 
 | Engine | Dataset | Workers | Cores | Duration (s) | Rows/sec | Speedup | Efficiency |
 |---|---|---:|---:|---:|---:|---:|---:|
-| spark | balanced | 1 | 2 | 12.80 | 287,627 | 1.00× | 100% |
-| spark | balanced | 2 | 4 | 11.37 | 323,789 | 1.13× | 56% |
-| spark | balanced | 4 | 8 | 10.62 | 346,794 | **1.21×** | **30%** |
-| spark | skewed | 1 | 2 | 14.29 | 436,705 | 1.00× | 100% |
-| spark | skewed | 2 | 4 | 10.29 | 606,486 | 1.39× | 69% |
-| spark | skewed | 4 | 8 | 11.74 | 531,552 | **1.22×** | **30%** |
-| dask | balanced | 1 | 2 | 14.61 | 252,051 | 1.00× | 100% |
-| dask | balanced | 2 | 4 | 10.20 | 360,858 | 1.43× | 72% |
-| dask | balanced | 4 | 8 | 8.18 | 450,134 | **1.79×** | **45%** |
-| dask | skewed | 1 | 2 | 18.95 | 329,268 | 1.00× | 100% |
-| dask | skewed | 2 | 4 | 12.65 | 493,286 | 1.50× | 75% |
-| dask | skewed | 4 | 8 | 9.88 | 631,405 | **1.92×** | **48%** |
-| ray | balanced | 1 | 2 | 59.35 | 62,045 | 1.00× | 100% |
-| ray | balanced | 2 | 4 | 37.68 | 97,730 | 1.58× | 79% |
-| ray | balanced | 4 | 8 | 24.75 | 148,746 | **2.40×** | **60%** |
-| ray | skewed | 1 | 2 | 89.68 | 69,589 | 1.00× | 100% |
-| ray | skewed | 2 | 4 | 53.80 | 116,006 | 1.67× | 83% |
-| ray | skewed | 4 | 8 | 40.31 | 154,798 | **2.22×** | **56%** |
+| spark | balanced | 1 | 2 | 10.03 | 366,972 | 1.00× | 100% |
+| spark | balanced | 2 | 4 | 11.70 | 314,835 | 0.86× | 43% |
+| spark | balanced | 4 | 8 | 11.55 | 318,852 | **0.87×** | **22%** |
+| spark | skewed | 1 | 2 | 11.24 | 555,108 | 1.00× | 100% |
+| spark | skewed | 2 | 4 | 12.24 | 509,836 | 0.92× | 46% |
+| spark | skewed | 4 | 8 | 11.05 | 564,727 | **1.02×** | **25%** |
+| dask | balanced | 1 | 2 | 20.89 | 176,234 | 1.00× | 100% |
+| dask | balanced | 2 | 4 | 14.69 | 250,711 | 1.42× | 71% |
+| dask | balanced | 4 | 8 | 11.96 | 307,980 | **1.75×** | **44%** |
+| dask | skewed | 1 | 2 | 28.27 | 220,788 | 1.00× | 100% |
+| dask | skewed | 2 | 4 | 17.63 | 353,890 | 1.60× | 80% |
+| dask | skewed | 4 | 8 | 13.99 | 445,973 | **2.02×** | **50%** |
+| ray | balanced | 1 | 2 | 87.77 | 41,951 | 1.00× | 100% |
+| ray | balanced | 2 | 4 | 51.17 | 71,963 | 1.72× | 86% |
+| ray | balanced | 4 | 8 | 20.95 | 175,726 | **4.19×** | **105%** |
+| ray | skewed | 1 | 2 | 125.53 | 49,713 | 1.00× | 100% |
+| ray | skewed | 2 | 4 | 66.97 | 93,181 | 1.87× | 94% |
+| ray | skewed | 4 | 8 | 34.31 | 181,886 | **3.66×** | **91%** |
 
-*Speedup* is the 1-worker duration ÷ this duration. *Efficiency* is speedup ÷ the worker-count factor: 100% would be perfectly linear, 50% means half of each added worker is wasted. All 18 runs produced the same 572,369 output rows.
+*Speedup* is the 1-worker duration ÷ this duration. *Efficiency* is speedup ÷ the worker-count factor: 100% would be perfectly linear. All 18 configurations produced the same 572,369 output rows.
 
 **What the numbers say**
 
-- **Nobody scales linearly, and the ranking flips depending on what you ask.** Dask is fastest in absolute terms at every worker count (8.18s on 4 workers). Ray is the slowest but scales best (2.40×, 60% efficiency). Spark barely benefits from more workers at all (1.21×, 30%).
-- **Ray scales best because it has the most work to parallelize.** Its per-row Python processing is CPU-bound, and CPU-bound work is exactly what extra cores absorb. Spark and Dask push the same aggregation into vectorized/JVM code, so they start near the floor set by I/O and coordination and have less left to win.
-- **Spark's fixed overhead dominates at this size.** A ~12s job spends a large share on job setup, S3A listing, and shuffle scaffolding, none of which shrinks when workers are added. Spark's skewed run at 4 workers (11.74s) is actually *slower* than at 2 (10.29s) — past a point, more executors mean more shuffle partitions and more coordination for the same work.
-- **Efficiency decays the same way for everyone**, which is Amdahl's law showing up: each job has a serial tail (driver-side assembly of the ~572k-row result, the lookup join, and the write) that no number of workers can shrink. That tail is why even Ray lands at 60% rather than near 100%.
-- **Skew doesn't change the scaling story.** Speedup curves for balanced and skewed data are close for all three engines, which is consistent with the Phase 2 finding that key skew is mostly absorbed by map-side partial aggregation.
+- **Spark does not scale here at all — it gets slower.** Going from 1 to 2 workers costs 17% on balanced data. A ~10 s job is dominated by job setup, S3A listing and shuffle scaffolding, and spreading it over more executors adds network shuffle and coordination without reducing that fixed cost. Spark is still the fastest engine in absolute terms at every worker count.
+- **Ray's speedup is super-linear (4.19×), which is a memory effect, not magic.** Its worker logs show the object store spilling **2–4 GB to disk at 1 and 2 workers, and not at all at 4**: each worker contributes 512 MB of object store, so only at 4 workers does the working set fit in memory. Part of the "scaling" is really the disappearance of disk spill. It is the honest number for this hardware, but it would not survive on workers sized to avoid spilling in the first place.
+- **Dask scales the most predictably** — 1.75× on balanced and 2.02× on skewed data at 4 workers — with efficiency decaying the way Amdahl's law predicts, because each job keeps a serial tail (driver-side assembly of the 572k-row result, the lookup join, and the write).
+- **Dask scales better on the skewed dataset than the balanced one** (2.02× vs 1.75×): it has 1.69× the rows, so there is more parallel work to amortize the same fixed overhead. Ray's skewed speedup is *lower* (3.66× vs 4.19×) only because its balanced baseline is inflated by the spilling described above.
+- **Absolute durations here are higher than the local-mode table above** (Dask 20.9 s vs 9.4 s at 1 worker). Local mode gives Dask 4 cores in-process with no serialization between workers; a 1-worker cluster gives it 2 cores plus network hops to the scheduler and object transfer. Cluster mode is about scaling behaviour, not peak single-box speed.
 
-**Caveats worth stating.** These are single-host containers, so "network" between workers is loopback — real multi-machine clusters pay more for shuffles, which would likely lower efficiency further. Each configuration was run once (`--repeats 1`); the ±1s of run-to-run noise doesn't change any of the conclusions above, but it does explain small non-monotonic wobbles like Spark's skewed 2→4 worker result.
+**Caveats worth stating.** These are containers on one host, so inter-worker "network" is loopback — real multi-machine clusters pay more for shuffles, which would push efficiency lower. Worker memory (2 GB, 512 MB object store) is deliberately small so 4 workers fit on a laptop, and Ray's spilling above is a direct consequence; on larger workers Ray's curve would flatten toward the others.
 
 ---
 
