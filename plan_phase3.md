@@ -88,5 +88,5 @@ says about each engine, plus cluster quick-start commands.
 - [x] Speedup and parallel efficiency reported per engine and dataset
 - [x] Grafana shows the scaling panels with real data
 - [x] `tests/test_scaling.py` passes; existing unit + integration tests still green
-- [ ] `cluster-smoke` CI job green alongside the existing jobs
+- [x] `cluster-smoke` CI job green alongside the existing jobs
 - [x] README scaling section written from a real sweep
