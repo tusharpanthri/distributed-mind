@@ -7,11 +7,12 @@ import socket
 import time
 from typing import Any
 
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import BooleanType
 
-from engines.base import BenchmarkEngine, raise_injected_failure
+from engines.base import BenchmarkEngine, raise_injected_failure, workload_of
+from workloads.spec import PartialField, WorkloadSpec
 
 logger = logging.getLogger("distributedmind.spark")
 
@@ -109,87 +110,134 @@ class SparkEngine(BenchmarkEngine):
     ) -> tuple[int, int]:
         spark = self._spark
         assert spark is not None, "Call setup() before run()"
+        spec = workload_of(self._config)
 
-        # 1. Read partitioned Parquet from MinIO
-        events = spark.read.parquet(input_path)
+        # 1. Read only the columns this workload needs
+        events = spark.read.parquet(input_path).select(*spec.input_columns)
 
-        # 2. Filter to PushEvent only
-        events = events.filter(
-            (F.col("type") == "PushEvent")
-            & (F.col("repo_id").isNotNull())
-        )
+        # 2. Filter per the spec
+        for condition in _filter_conditions(spec):
+            events = events.filter(condition)
         if inject_failure:
-            events = events.filter(_failing_udf(F.col("repo_id")))
+            events = events.filter(_failing_udf(F.col(spec.group_by[0])))
         # Filtered events are materialized once, then counted and aggregated
         # (Dask persists and Ray materializes at the same point).
         events = events.cache()
         rows_processed = events.count()
 
-        # 3. Group by repo_id / repo_name, compute aggregates
+        # 3. Aggregate per the spec
         if mitigate_skew:
-            aggregated = self._aggregate_salted(events)
+            aggregated = self._aggregate_salted(events, spec)
         else:
-            aggregated = events.groupBy("repo_id", "repo_name").agg(
-                F.count("*").alias("event_count"),
-                F.countDistinct("actor_login").alias("unique_actors"),
-                F.avg("payload_size").alias("avg_payload_size"),
+            aggregated = events.groupBy(*spec.group_by).agg(*_direct_aggs(spec))
+
+        # 4. Join the lookup table (left join → spec's `missing` for absent keys)
+        if spec.join:
+            lookup = spark.read.parquet(lookup_path).select(spec.join.key, *spec.join.columns)
+            aggregated = aggregated.join(lookup, on=spec.join.key, how="left").fillna(
+                {column: spec.join.missing for column in spec.join.columns}
             )
+        enriched = aggregated.select(*spec.output_columns)
 
-        # 4. Join with repo-metadata lookup (left join → unknown for missing)
-        lookup = spark.read.parquet(lookup_path)
-        enriched = aggregated.join(lookup, on="repo_id", how="left").fillna(
-            {"language": "unknown", "repo_owner_type": "unknown"}
-        )
-
-        # 5. Write partitioned by language
-        enriched.write.mode("overwrite").partitionBy("language").parquet(output_path)
+        # 5. Write, partitioned as the spec asks
+        writer = enriched.write.mode("overwrite")
+        if spec.partition_by:
+            writer = writer.partitionBy(spec.partition_by)
+        writer.parquet(output_path)
 
         rows_output = enriched.count()
         events.unpersist()
         return rows_processed, rows_output
 
-    def _aggregate_salted(self, events: DataFrame) -> DataFrame:
-        """Salting: split each hot repo_id into N sub-keys, aggregate, then recombine.
+    def _aggregate_salted(self, events: DataFrame, spec: WorkloadSpec) -> DataFrame:
+        """Salting: split each hot key into N sub-keys, aggregate, then recombine.
 
-        Additive aggregates (count, sum, non-null count) are computed per
-        (repo, salt) and summed. Distinct actors can't be summed across random
-        salts, so they're computed by first de-duplicating (repo, actor) pairs:
-        that shuffle is keyed on the actor too, so a hot repo's rows spread out,
-        and map-side dedupe collapses bot accounts that push thousands of times.
+        Additive aggregates (count, sum, min, max, and mean carried as sum +
+        non-null count) are computed per (key, salt) and combined. A distinct
+        count can't be summed across random salts, so it is computed by first
+        de-duplicating (keys, column): that shuffle is keyed on the column too,
+        so a hot key's rows spread out, and map-side dedupe collapses the
+        repeat offenders (bot accounts pushing thousands of times).
         """
         skew_cfg = self._config.get("skew", {})
         top_n = int(skew_cfg.get("hot_key_top_n", 10))
         buckets = int(skew_cfg.get("salt_buckets", 8))
 
-        hot_ids = [
-            row["repo_id"]
-            for row in events.groupBy("repo_id").count().orderBy(F.desc("count")).limit(top_n).collect()
+        hot_keys = [
+            row[spec.skew_key]
+            for row in events.groupBy(spec.skew_key).count()
+            .orderBy(F.desc("count")).limit(top_n).collect()
         ]
-        salt = F.when(F.col("repo_id").isin(hot_ids), F.pmod(F.hash("id"), F.lit(buckets))).otherwise(F.lit(0))
+        salt = (
+            F.when(F.col(spec.skew_key).isin(hot_keys), F.pmod(F.hash(spec.row_id), F.lit(buckets)))
+            .otherwise(F.lit(0))
+        )
 
-        partial = (
+        partial_exprs = []
+        for aggregation in spec.additive_aggregations:
+            for partial_field in aggregation.partial_fields():
+                partial_exprs.append(_partial_expr(partial_field).alias(partial_field.name))
+        partials = (
             events.withColumn("salt", salt)
-            .groupBy("repo_id", "repo_name", "salt")
-            .agg(
-                F.count("*").alias("cnt"),
-                F.sum("payload_size").alias("psum"),
-                F.count("payload_size").alias("pcnt"),
+            .groupBy(*spec.group_by, "salt")
+            .agg(*partial_exprs)
+        )
+
+        combine_exprs = []
+        for aggregation in spec.additive_aggregations:
+            fields = aggregation.partial_fields()
+            if aggregation.op == "mean":
+                total, count = fields
+                combine_exprs.append((F.sum(total.name) / F.sum(count.name)).alias(aggregation.name))
+            else:
+                combiner = getattr(F, aggregation.combine_op)
+                combine_exprs.append(combiner(fields[0].name).alias(aggregation.name))
+        result = partials.groupBy(*spec.group_by).agg(*combine_exprs)
+
+        for aggregation in spec.distinct_aggregations:
+            distinct = (
+                events.select(*spec.group_by, aggregation.value_column)
+                .where(F.col(aggregation.value_column).isNotNull())
+                .distinct()
+                .groupBy(*spec.group_by)
+                .agg(F.count("*").alias(aggregation.name))
             )
-        )
-        additive = partial.groupBy("repo_id", "repo_name").agg(
-            F.sum("cnt").alias("event_count"),
-            (F.sum("psum") / F.sum("pcnt")).alias("avg_payload_size"),
-        )
-        distinct_actors = (
-            events.select("repo_id", "repo_name", "actor_login")
-            .where(F.col("actor_login").isNotNull())
-            .distinct()
-            .groupBy("repo_id", "repo_name")
-            .agg(F.count("*").alias("unique_actors"))
-        )
-        return additive.join(distinct_actors, on=["repo_id", "repo_name"], how="left").select(
-            "repo_id", "repo_name", "event_count", "unique_actors", "avg_payload_size"
-        )
+            result = result.join(distinct, on=spec.group_by, how="left").withColumn(
+                aggregation.name, F.coalesce(F.col(aggregation.name), F.lit(0))
+            )
+
+        return result.select(*spec.group_by, *(a.name for a in spec.aggregations))
+
+
+def _filter_conditions(spec: WorkloadSpec) -> list[Column]:
+    conditions = []
+    if spec.filter:
+        conditions.append(F.col(spec.filter.column) == F.lit(spec.filter.equals))
+    conditions.extend(F.col(column).isNotNull() for column in spec.require_not_null)
+    return conditions
+
+
+def _direct_aggs(spec: WorkloadSpec) -> list[Column]:
+    exprs = []
+    for aggregation in spec.aggregations:
+        if aggregation.op == "count":
+            expr = F.count("*")
+        elif aggregation.op == "distinct_count":
+            expr = F.countDistinct(aggregation.value_column)
+        elif aggregation.op == "mean":
+            expr = F.avg(aggregation.value_column)
+        else:  # sum, min, max
+            expr = getattr(F, aggregation.op)(aggregation.value_column)
+        exprs.append(expr.alias(aggregation.name))
+    return exprs
+
+
+def _partial_expr(partial: PartialField) -> Column:
+    if partial.op == "count":
+        # Counting the column (not *) is what makes it a non-null count, which
+        # is the denominator a mean needs.
+        return F.count(partial.column) if partial.column else F.count("*")
+    return getattr(F, partial.op)(partial.value_column)
 
 
 @F.udf(returnType=BooleanType())

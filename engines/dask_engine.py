@@ -13,7 +13,8 @@ from dask.distributed import Client, LocalCluster
 from minio import Minio
 from minio.deleteobjects import DeleteObject
 
-from engines.base import BenchmarkEngine, raise_injected_failure
+from engines.base import BenchmarkEngine, raise_injected_failure, workload_of
+from workloads.spec import Aggregation, WorkloadSpec
 
 logger = logging.getLogger("distributedmind.dask")
 
@@ -109,6 +110,7 @@ class DaskEngine(BenchmarkEngine):
         mitigate_skew: bool,
         inject_failure: bool,
     ) -> tuple[int, int]:
+        spec = workload_of(self._config)
         minio = self._config["minio"]
         storage_options = {
             "key": minio["access_key"],
@@ -116,18 +118,20 @@ class DaskEngine(BenchmarkEngine):
             "endpoint_url": minio["endpoint"],
         }
 
-        # Convert s3a:// → s3:// (s3fs uses s3://)
+        # Convert s3a:// -> s3:// (s3fs uses s3://)
         s3_input = input_path.replace("s3a://", "s3://")
         s3_output = output_path.replace("s3a://", "s3://")
         s3_lookup = lookup_path.replace("s3a://", "s3://")
 
-        # 1. Read partitioned Parquet from MinIO
-        events = dd.read_parquet(s3_input, storage_options=storage_options)
+        # 1. Read only the columns this workload needs
+        events = dd.read_parquet(s3_input, storage_options=storage_options,
+                                 columns=spec.input_columns)
 
-        # 2. Filter to PushEvent only
-        events = events[
-            (events["type"] == "PushEvent") & events["repo_id"].notnull()
-        ]
+        # 2. Filter per the spec
+        if spec.filter:
+            events = events[events[spec.filter.column] == spec.filter.equals]
+        for column in spec.require_not_null:
+            events = events[events[column].notnull()]
         if inject_failure:
             events = events.map_partitions(_failing_partition, meta=events._meta)
         # Filtered events are materialized once, then counted and aggregated
@@ -135,49 +139,37 @@ class DaskEngine(BenchmarkEngine):
         events = events.persist()
         rows_processed = int(len(events))
 
-        # 3. Group by repo_id / repo_name, compute aggregates.
+        # 3. Aggregate per the spec.
         # Both branches return pandas: the groupbys/shuffles run distributed,
-        # but their result is one row per repo, and merging two dask groupby
+        # but their result is one row per group, and merging two dask groupby
         # results directly trips a dask-expr optimizer KeyError
         # ("['repo_id' 'repo_name'] not in index") once the input spans several
         # partitions. Ray's engine assembles its output the same way.
         if mitigate_skew:
-            aggregated_pd = self._aggregate_repartitioned(events)
+            aggregated_pd = self._aggregate_repartitioned(events, spec)
         else:
-            # "nunique" isn't accepted inside groupby().agg() on this dask-expr
-            # version, so it's computed as its own dedicated groupby call and merged.
-            aggregated = (
-                events.groupby(["repo_id", "repo_name"])
-                .agg(
-                    event_count=("type", "count"),
-                    avg_payload_size=("payload_size", "mean"),
-                )
-                .reset_index()
-            )
-            unique_actors = (
-                events.groupby(["repo_id", "repo_name"])["actor_login"]
-                .nunique()
-                .rename("unique_actors")
-                .reset_index()
-            )
-            # One graph, so the filtered events are traversed once for both.
-            aggregated_pd, unique_pd = dask.compute(aggregated, unique_actors)
-            aggregated_pd = aggregated_pd.merge(unique_pd, on=["repo_id", "repo_name"], how="left")
+            aggregated_pd = self._aggregate_direct(events, spec)
 
-        # 4. Join with repo-metadata lookup (left join → unknown for missing)
-        lookup_pd: pd.DataFrame = dd.read_parquet(s3_lookup, storage_options=storage_options).compute()
-        enriched = aggregated_pd.merge(lookup_pd, on="repo_id", how="left")
-        enriched["language"] = enriched["language"].fillna("unknown")
-        enriched["repo_owner_type"] = enriched["repo_owner_type"].fillna("unknown")
+        # 4. Join the lookup table (left join -> spec's `missing` for absent keys)
+        if spec.join:
+            lookup_pd: pd.DataFrame = dd.read_parquet(
+                s3_lookup, storage_options=storage_options,
+                columns=[spec.join.key, *spec.join.columns],
+            ).compute()
+            aggregated_pd = aggregated_pd.merge(lookup_pd, on=spec.join.key, how="left")
+            for column in spec.join.columns:
+                aggregated_pd[column] = aggregated_pd[column].fillna(spec.join.missing)
+        aggregated_pd = _normalize_count_dtypes(aggregated_pd, spec)
+        enriched = aggregated_pd[spec.output_columns]
 
-        # 5. Write partitioned by language.
+        # 5. Write, partitioned as the spec asks.
         # Prefix is cleared explicitly first (see _clear_output_prefix); the
         # write itself uses overwrite=False so dask never triggers s3fs's
         # bulk-delete path.
         self._clear_output_prefix(s3_output)
         dd.from_pandas(enriched, npartitions=max(1, self._available_cores())).to_parquet(
             s3_output,
-            partition_on=["language"],
+            partition_on=[spec.partition_by] if spec.partition_by else None,
             storage_options=storage_options,
             write_index=False,
             overwrite=False,
@@ -186,63 +178,127 @@ class DaskEngine(BenchmarkEngine):
         rows_output = int(len(enriched))
         return rows_processed, rows_output
 
-    def _aggregate_repartitioned(self, events: dd.DataFrame) -> pd.DataFrame:
+    def _aggregate_direct(self, events: dd.DataFrame, spec: WorkloadSpec) -> pd.DataFrame:
+        """One groupby per spec.
+
+        Distinct counts are separate groupby calls: "nunique" isn't accepted
+        inside groupby().agg() on this dask-expr version.
+        """
+        named = {a.name: _pandas_agg(a, spec) for a in spec.additive_aggregations}
+        frames = [events.groupby(spec.group_by).agg(**named).reset_index()]
+        for aggregation in spec.distinct_aggregations:
+            frames.append(
+                events.groupby(spec.group_by)[aggregation.column]
+                .nunique()
+                .rename(aggregation.name)
+                .reset_index()
+            )
+        # One graph, so the filtered events are traversed once for all of them.
+        computed = dask.compute(*frames)
+        result = computed[0]
+        for frame in computed[1:]:
+            result = result.merge(frame, on=spec.group_by, how="left")
+        return result
+
+    def _aggregate_repartitioned(self, events: dd.DataFrame, spec: WorkloadSpec) -> pd.DataFrame:
         """Repartition informed by the key distribution before the groupby.
 
         Input is first rebalanced into evenly sized partitions (one big
         Parquet file otherwise lands in a single partition). Rows of the top-N
-        repos get a salt so they hash to different output partitions
+        hot keys get a salt so they hash to different output partitions
         (``split_out``) instead of piling onto one, then partials are combined.
-        Distinct actors come from de-duplicated (repo, actor) pairs, which
-        shuffle on the actor too and so don't concentrate on a hot repo.
+        Distinct counts come from de-duplicated (keys, column) pairs, which
+        shuffle on the column too and so don't concentrate on a hot key.
         """
         skew_cfg = self._config.get("skew", {})
         top_n = int(skew_cfg.get("hot_key_top_n", 10))
         buckets = int(skew_cfg.get("salt_buckets", 8))
         n_parts = max(2, 2 * self._available_cores())
 
-        hot_ids = set(events["repo_id"].value_counts().nlargest(top_n).index.compute().tolist())
+        hot_keys = set(events[spec.skew_key].value_counts().nlargest(top_n).index.compute().tolist())
         events = events.repartition(npartitions=n_parts)
-        salted = events.map_partitions(_add_salt, hot_ids, buckets)
+        salted = events.map_partitions(_add_salt, hot_keys, buckets, spec.skew_key, spec.row_id)
 
+        partial_named = {}
+        for aggregation in spec.additive_aggregations:
+            for partial_field in aggregation.partial_fields():
+                partial_named[partial_field.name] = (
+                    (spec.row_id, "size") if partial_field.column is None
+                    else (partial_field.value_column, partial_field.op)
+                )
         partial = (
-            salted.groupby(["repo_id", "repo_name", "salt"])
-            .agg(
-                cnt=("type", "count"),
-                psum=("payload_size", "sum"),
-                pcnt=("payload_size", "count"),
-                split_out=n_parts,
-            )
+            salted.groupby([*spec.group_by, "salt"])
+            .agg(**partial_named, split_out=n_parts)
             .reset_index()
         )
-        # The combine stage sees at most ``buckets`` partial rows per repo, so it
+        # The combine stage sees at most ``buckets`` partial rows per group, so it
         # needs no split_out (and a second split_out here trips a dask-expr
         # optimizer KeyError when the result is merged below).
-        additive = (
-            partial.groupby(["repo_id", "repo_name"])
-            .agg(event_count=("cnt", "sum"), psum=("psum", "sum"), pcnt=("pcnt", "sum"))
-            .reset_index()
-        )
-        additive["avg_payload_size"] = additive["psum"] / additive["pcnt"].where(additive["pcnt"] > 0)
-        additive = additive.drop(columns=["psum", "pcnt"])
+        combine_named = {
+            field.name: (field.name, "sum" if field.op == "count" else field.op)
+            for aggregation in spec.additive_aggregations
+            for field in aggregation.partial_fields()
+        }
+        additive = partial.groupby(spec.group_by).agg(**combine_named).reset_index()
 
-        distinct_actors = (
-            events[["repo_id", "repo_name", "actor_login"]]
-            .dropna(subset=["actor_login"])
+        distinct_frames = [
+            events[[*spec.group_by, aggregation.column]]
+            .dropna(subset=[aggregation.column])
             .drop_duplicates(split_out=n_parts)
-            .groupby(["repo_id", "repo_name"])
+            .groupby(spec.group_by)
             .size(split_out=n_parts)
-            .rename("unique_actors")
+            .rename(aggregation.name)
             .reset_index()
-        )
-        additive_pd, distinct_pd = dask.compute(additive, distinct_actors)
-        return additive_pd.merge(distinct_pd, on=["repo_id", "repo_name"], how="left")
+            for aggregation in spec.distinct_aggregations
+        ]
+        computed = dask.compute(additive, *distinct_frames)
+        result = computed[0]
+        for frame in computed[1:]:
+            result = result.merge(frame, on=spec.group_by, how="left")
+
+        for aggregation in spec.additive_aggregations:
+            fields = aggregation.partial_fields()
+            if aggregation.op == "mean":
+                total, count = fields
+                result[aggregation.name] = result[total.name] / result[count.name].where(
+                    result[count.name] > 0
+                )
+            else:
+                result[aggregation.name] = result[fields[0].name]
+        return result[[*spec.group_by, *(a.name for a in spec.aggregations)]]
 
 
-def _add_salt(part: pd.DataFrame, hot_ids: set[int], buckets: int) -> pd.DataFrame:
-    salt = pd.util.hash_pandas_object(part["id"], index=False).to_numpy() % buckets
+def _normalize_count_dtypes(frame: pd.DataFrame, spec: WorkloadSpec) -> pd.DataFrame:
+    """Counts as plain int64.
+
+    A "size" aggregation over pyarrow-backed columns yields pandas' nullable
+    Int64, which survives into the Parquet output and makes dtypes differ from
+    Spark and Ray for identical values. A group with no non-null values counts
+    as 0 rather than null.
+    """
+    for aggregation in spec.aggregations:
+        if aggregation.op in ("count", "distinct_count"):
+            frame[aggregation.name] = frame[aggregation.name].fillna(0).astype("int64")
+    return frame
+
+
+def _pandas_agg(aggregation: "Aggregation", spec: WorkloadSpec) -> tuple[str, str]:
+    """Named-aggregation tuple for dask/pandas ``agg``.
+
+    A plain row count has no column of its own, so it counts the row-id column
+    with "size"; ``count`` over a value column means non-null values, which is
+    the denominator a mean needs.
+    """
+    if aggregation.op == "count":
+        return (spec.row_id, "size")
+    return (aggregation.value_column, aggregation.op)
+
+
+def _add_salt(part: pd.DataFrame, hot_keys: set[Any], buckets: int,
+              skew_key: str, row_id: str) -> pd.DataFrame:
+    salt = pd.util.hash_pandas_object(part[row_id], index=False).to_numpy() % buckets
     part = part.assign(salt=salt.astype("int64"))
-    part.loc[~part["repo_id"].isin(hot_ids), "salt"] = 0
+    part.loc[~part[skew_key].isin(hot_keys), "salt"] = 0
     return part
 
 

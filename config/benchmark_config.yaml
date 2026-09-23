@@ -23,6 +23,8 @@ benchmark:
     - dask
     - ray
   output_dir: "results"
+  # Declarative workload spec; --workload overrides it. See config/workloads/.
+  workload: "${WORKLOAD_SPEC:config/workloads/gharchive-repo-activity.yaml}"
   input_path: "s3a://raw-data/events"
   skewed_input_path: "s3a://raw-data/events-skewed"
   output_path: "s3a://processed-data/output"

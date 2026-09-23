@@ -9,19 +9,19 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
-import re
 import sys
 from datetime import datetime, timezone
 from typing import Any
 
 import click
-import yaml
 from pythonjsonlogger import jsonlogger
 
+from benchmark.config import load_yaml_config
 from benchmark.metrics import PrometheusRecorder
 from benchmark.results_writer import write_results
+from benchmark.storage import dataset_schema
 from engines.base import BenchmarkEngine, BenchmarkResult, DatasetType
+from workloads.spec import WorkloadSchemaError, WorkloadSpec, WorkloadSpecError, load_workload
 
 logger = logging.getLogger("distributedmind.runner")
 
@@ -33,28 +33,38 @@ def _setup_logging() -> None:
     logging.root.addHandler(handler)
 
 
-def _resolve_env(value: str) -> str:
-    def replace(m: re.Match) -> str:
-        var, _, default = m.group(1).partition(":")
-        return os.environ.get(var, default)
-
-    return re.sub(r"\$\{([^}]+)\}", replace, value)
+#: Kept as the module-level name the tests and data scripts already import.
+_load_config = load_yaml_config
 
 
-def _load_config(config_path: str) -> dict[str, Any]:
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
+def load_workload_spec(config: dict[str, Any], workload_path: str | None) -> WorkloadSpec:
+    """Load the workload spec named on the CLI, else the one in the config."""
+    path = workload_path or config["benchmark"]["workload"]
+    spec = load_workload(path)
+    logger.info("Workload loaded", extra={"workload": spec.name, "path": path})
+    return spec
 
-    def walk(node: object) -> object:
-        if isinstance(node, dict):
-            return {k: walk(v) for k, v in node.items()}
-        if isinstance(node, list):
-            return [walk(i) for i in node]
-        if isinstance(node, str):
-            return _resolve_env(node)
-        return node
 
-    return walk(raw)  # type: ignore[return-value]
+def validate_datasets(config: dict[str, Any], spec: WorkloadSpec, datasets: list[DatasetType]) -> None:
+    """Fail fast if the data doesn't match the spec.
+
+    Checked once up front so a mismatched column is reported in seconds with
+    the column named, rather than surfacing deep inside a Spark stage.
+    """
+    bench = config["benchmark"]
+    paths = {"balanced": bench["input_path"], "skewed": bench["skewed_input_path"]}
+    for dataset in datasets:
+        spec.validate_against(dataset_schema(paths[dataset], config["minio"]),
+                              source=f"{dataset} dataset ({paths[dataset]})")
+    if spec.join:
+        join_schema = dataset_schema(spec.join.path, config["minio"])
+        missing = [c for c in (spec.join.key, *spec.join.columns) if c not in join_schema.names]
+        if missing:
+            raise WorkloadSchemaError(
+                f"lookup table ({spec.join.path}) is missing column(s) {missing}; "
+                f"it has: {', '.join(join_schema.names)}"
+            )
+    logger.info("Dataset schema validated", extra={"workload": spec.name})
 
 
 def _build_engine(name: str) -> BenchmarkEngine:
@@ -239,6 +249,8 @@ def _parse_list(value: str, allowed: dict[str, Any]) -> list[Any]:
               help="Untimed run per engine before measuring")
 @click.option("--simulate-failure", is_flag=True,
               help="Inject a worker-task failure into each skewed run to exercise retry/recovery")
+@click.option("--workload", "workload_path", default=None,
+              help="Workload spec YAML (default: benchmark.workload from the config)")
 @click.option("--cluster-workers", default=None, type=int,
               help="Worker count to record on results (default: cluster.workers from config)")
 @click.option("--metrics-port", default=0, show_default=True,
@@ -261,6 +273,7 @@ def main(
     repeats: int,
     warmup: bool,
     simulate_failure: bool,
+    workload_path: str | None,
     cluster_workers: int | None,
     metrics_port: int,
     output: str | None,
@@ -281,11 +294,21 @@ def main(
         recorder.serve(metrics_port)
 
     engine_names = [e.strip() for e in engines.split(",") if e.strip()]
+    dataset_list = _parse_list(datasets, {"balanced": "balanced", "skewed": "skewed"})
+
+    # A bad spec or mismatched dataset is a user error, not a crash: show the
+    # message without a traceback.
+    try:
+        config["workload"] = load_workload_spec(config, workload_path)
+        validate_datasets(config, config["workload"], dataset_list)
+    except (WorkloadSpecError, WorkloadSchemaError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
     run_benchmark(
         engine_names,
         config,
         output,
-        datasets=_parse_list(datasets, {"balanced": "balanced", "skewed": "skewed"}),
+        datasets=dataset_list,
         mitigations=_parse_list(mitigation, {"off": False, "on": True}),
         repeats=max(1, repeats),
         warmup=warmup,

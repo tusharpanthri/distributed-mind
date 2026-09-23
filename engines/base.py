@@ -6,9 +6,12 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from benchmark.metrics import RunMetrics, measure
+
+if TYPE_CHECKING:
+    from workloads.spec import WorkloadSpec
 
 DatasetType = Literal["balanced", "skewed"]
 
@@ -17,6 +20,25 @@ logger = logging.getLogger("distributedmind.engine")
 
 class InjectedWorkerFailure(RuntimeError):
     """Raised inside a worker task when failure simulation is enabled."""
+
+
+def workload_of(config: dict[str, Any]) -> "WorkloadSpec":
+    """The workload spec for this run.
+
+    The runner loads and validates the spec up front and puts it in the config;
+    when an engine is driven directly (tests, or using this as a library) the
+    configured default is loaded on demand.
+    """
+    spec = config.get("workload")
+    if spec is None:
+        from workloads.spec import load_workload
+
+        path = config.get("benchmark", {}).get("workload")
+        if not path:
+            raise RuntimeError("no workload spec: set benchmark.workload in the config")
+        spec = load_workload(path)
+        config["workload"] = spec
+    return spec
 
 
 def raise_injected_failure(engine_name: str) -> None:
@@ -98,7 +120,11 @@ class BenchmarkEngine(ABC):
         max_retries = int(ft.get("max_retries", 3))
         backoff_base = float(ft.get("backoff_base_seconds", 0.5))
         backoff_max = float(ft.get("backoff_max_seconds", 8.0))
-        lookup_path = self._config["benchmark"]["lookup_path"]
+        spec = self._config.get("workload")
+        lookup_path = (
+            spec.join.path if spec is not None and spec.join
+            else self._config["benchmark"].get("lookup_path", "")
+        )
 
         metrics = RunMetrics()
         retry_count = 0

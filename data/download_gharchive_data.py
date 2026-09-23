@@ -11,7 +11,6 @@ import gzip
 import io
 import json
 import logging
-import os
 import sys
 from datetime import datetime
 from typing import Iterator
@@ -19,9 +18,10 @@ from typing import Iterator
 import click
 import pyarrow as pa
 import pyarrow.parquet as pq
-import yaml
 from minio import Minio
 from pythonjsonlogger import jsonlogger
+
+from benchmark.config import load_yaml_config
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -216,31 +216,7 @@ def _upload_parquet(client: Minio, bucket: str, key: str, table: pa.Table) -> No
 # Main ingestion logic
 # ---------------------------------------------------------------------------
 
-def _resolve_env(value: str) -> str:
-    """Resolve ${ENV_VAR:default} placeholders in config values."""
-    import re
-
-    def replace(m: re.Match) -> str:
-        var, _, default = m.group(1).partition(":")
-        return os.environ.get(var, default)
-
-    return re.sub(r"\$\{([^}]+)\}", replace, value)
-
-
-def _load_config(config_path: str) -> dict:
-    with open(config_path) as f:
-        raw = yaml.safe_load(f)
-
-    def walk(node: object) -> object:
-        if isinstance(node, dict):
-            return {k: walk(v) for k, v in node.items()}
-        if isinstance(node, list):
-            return [walk(i) for i in node]
-        if isinstance(node, str):
-            return _resolve_env(node)
-        return node
-
-    return walk(raw)  # type: ignore[return-value]
+_load_config = load_yaml_config
 
 
 def ingest(

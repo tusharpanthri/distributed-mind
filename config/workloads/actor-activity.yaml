@@ -1,0 +1,27 @@
+# Second workload, shipped to prove the engines are spec-driven rather than
+# hardcoded: a different group key, different aggregations, and no join.
+#
+#   python -m benchmark.runner --workload config/workloads/actor-activity.yaml
+name: actor-activity
+
+row_id: id
+skew_key: actor_login
+
+columns:
+  id: string
+  type: string
+  actor_login: string
+  repo_id: int64
+  payload_size: int64
+
+filter:
+  column: type
+  equals: PushEvent
+require_not_null: [actor_login]
+
+group_by: [actor_login]
+aggregations:
+  - {name: event_count, op: count}
+  - {name: repos_touched, op: distinct_count, column: repo_id}
+  - {name: total_commits, op: sum, column: payload_size}
+  - {name: largest_push, op: max, column: payload_size}

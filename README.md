@@ -168,6 +168,8 @@ The whole 12-run matrix (36 timed runs plus warmups) takes **13m17s**.
 
 *Skew slowdown* = skewed duration ÷ balanced duration for the same engine and mitigation setting. The skewed dataset has 1.69× the rows, so any ratio below 1.69 means per-row throughput held up under skew. Every configuration produces the same 572,369 output rows, and the tests check the values match too.
 
+**On run-to-run variance.** These are warm-state medians of 3. The same code on the same data measured up to 46% slower (Spark 6.40 s → 9.35 s, Dask 9.41 s → 14.59 s) when it ran first after an idle period rather than later in a sequence — page cache and JVM/worker warmth dominate at this job size. Differences smaller than roughly 20% between engines here should not be read as meaningful; the order-of-magnitude gaps (Ray vs the others) are.
+
 **What the numbers say**
 
 - **Spark is fastest, Ray is 4.6× slower.** Spark's JVM aggregation and parallel Parquet reads win at this size; Ray pays for moving every row through Python. Dask sits between them.
@@ -217,6 +219,93 @@ Measured with `python scripts/scaling_sweep.py --workers 1,2,4 --datasets balanc
 - **Absolute durations here are higher than the local-mode table above** (Dask 20.9 s vs 9.4 s at 1 worker). Local mode gives Dask 4 cores in-process with no serialization between workers; a 1-worker cluster gives it 2 cores plus network hops to the scheduler and object transfer. Cluster mode is about scaling behaviour, not peak single-box speed.
 
 **Caveats worth stating.** These are containers on one host, so inter-worker "network" is loopback — real multi-machine clusters pay more for shuffles, which would push efficiency lower. Worker memory (2 GB, 512 MB object store) is deliberately small so 4 workers fit on a laptop, and Ray's spilling above is a direct consequence; on larger workers Ray's curve would flatten toward the others.
+
+---
+
+## Bring your own data
+
+The workload is a **declarative spec**, not hardcoded in the engines, so benchmarking your own dataset means writing YAML rather than editing Spark, Dask and Ray code:
+
+```bash
+python -m benchmark.runner --workload config/workloads/my-workload.yaml
+```
+
+Two specs ship with the repo: [`gharchive-repo-activity.yaml`](config/workloads/gharchive-repo-activity.yaml) (the default, which every published number here was measured with) and [`actor-activity.yaml`](config/workloads/actor-activity.yaml) (different keys and aggregations, no join). A test runs the second one across all three engines and asserts they agree, so "the engines are spec-driven" is verified rather than claimed.
+
+### The data contract
+
+Your data must be a **Parquet dataset in S3-compatible storage** (MinIO, or real S3 — point `MINIO_ENDPOINT` at it), laid out like:
+
+```
+raw-data/events/date=2024-01-15/events-0000.parquet
+                               /events-0001.parquet   <- several files = parallelism
+```
+
+Hive-style `date=` partitioning is what the ingest writes; a flat directory of Parquet files works too. **One file per dataset is the thing to avoid** — it becomes a single partition for every engine and caps parallelism no matter how many workers you add (it also OOM-killed a 2 GB Dask worker here). Aim for files of a few hundred thousand rows; the ingest uses `data.rows_per_file: 250000`.
+
+Every column the spec references must exist, with a compatible type. This is validated up front, so a mismatch is reported in seconds with the column named rather than failing inside a Spark stage:
+
+| Declared type | Accepts |
+|---|---|
+| `string` | string, large_string |
+| `int64` / `int32` | any integer |
+| `float64` | any float or integer |
+| `bool` | boolean |
+| `timestamp` | any timestamp |
+
+### Writing a spec
+
+```yaml
+name: my-workload
+row_id: event_id          # unique per row; hashed to spread hot keys when mitigating
+skew_key: customer_id     # the key skew amplification inflates and mitigation treats as hot
+
+columns:                  # only what this workload reads
+  event_id: string
+  customer_id: int64
+  amount: float64
+  channel: string
+
+filter: {column: channel, equals: web}    # optional
+require_not_null: [customer_id]           # optional
+
+group_by: [customer_id]
+aggregations:
+  - {name: orders, op: count}
+  - {name: channels_used, op: distinct_count, column: channel}
+  - {name: avg_amount, op: mean, column: amount}
+
+# optional lookup join, applied after aggregation:
+# join: {path: "s3a://raw-data/lookup/customers.parquet", key: customer_id,
+#        columns: [segment], missing: unknown}
+# partition_by: segment
+```
+
+Supported aggregations — deliberately limited to those the skew-mitigation paths can decompose into a partial aggregate plus a combine:
+
+| Op | Needs a column | How mitigation handles it |
+|---|---|---|
+| `count` | no | partial count, summed |
+| `sum` | yes | partial sum, summed |
+| `mean` | yes | carried as sum + non-null count, divided at the end |
+| `min` / `max` | yes | partial min/max, folded |
+| `distinct_count` | yes | de-duplicate (keys, column), then count — not additive over a salt |
+
+Anything else is rejected when the spec loads, naming the supported ops. One engine-specific limit: **Ray's skew mitigation supports at most one `distinct_count`**, because spreading a hot key across buckets relies on that one column's value sets being disjoint per bucket. Spark and Dask have no such limit, and the error says so if you hit it.
+
+Note `key:`, not `on:`, for the join — YAML parses a bare `on:` as the boolean `true`.
+
+### What the published numbers were measured on
+
+| | Rows | Groups | Files | On disk |
+|---|---:|---:|---:|---:|
+| balanced | 3,682,194 PushEvents (3,884,642 total) | 572,369 repos | 16 | 102 MiB |
+| skewed | 6,240,579 PushEvents | 572,369 repos | 27 | 130 MiB |
+| lookup | 25 repos | — | 1 | 1.5 KiB |
+
+Eight columns, of which the default workload reads six: `id` (string), `type` (string), `actor_login` (string), `repo_id` (int64), `repo_name` (string), `payload_size` (int64). Snappy-compressed Parquet, ~250k rows per file.
+
+The **ingest** script is GH Archive-specific — it knows that API's JSON shape. Bringing your own data means bringing your own Parquet; everything downstream of that (skew amplification, the engines, mitigation, fault injection, scaling) is spec-driven.
 
 ---
 
@@ -339,12 +428,14 @@ GitHub Actions on every push/PR:
 ## Project layout
 
 ```
-benchmark/     runner (matrix, CLI), metrics (timing, memory, Prometheus), scaling maths, results writer
+benchmark/     runner (matrix, CLI), metrics, scaling maths, config + storage helpers, results writer
+workloads/     workload spec: parsing, validation, aggregation decomposition
+config/workloads/  the shipped workload specs (YAML)
 engines/       base (retry/backoff, failure injection), spark_engine, dask_engine, ray_engine
 data/          download_gharchive_data (ingest + flatten), amplify_skew
 scripts/       scaling_sweep.py (worker-count sweep, host-side)
 observability/ prometheus.yml, Grafana provisioning + dashboard
-tests/         test_engines, test_data_integrity, test_skew, test_fault_tolerance, test_scaling
+tests/         test_engines, test_data_integrity, test_skew, test_fault_tolerance, test_scaling, test_workload_spec
 config/        benchmark_config.yaml
 docker-compose.yml + docker-compose.cluster.yml (multi-node overlay)
 ```

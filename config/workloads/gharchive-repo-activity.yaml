@@ -1,0 +1,35 @@
+# Default workload: per-repo commit activity from GH Archive events.
+# This is the spec every published benchmark number in the README was measured with.
+name: gharchive-repo-activity
+
+row_id: id            # unique per row; hashed to spread hot keys when mitigating
+skew_key: repo_id     # the key amplify_skew inflates and the engines treat as hot
+
+# Columns this workload needs, with the types it expects. The dataset is
+# validated against these before any engine starts.
+columns:
+  id: string
+  type: string
+  actor_login: string
+  repo_id: int64
+  repo_name: string
+  payload_size: int64
+
+filter:
+  column: type
+  equals: PushEvent
+require_not_null: [repo_id]
+
+group_by: [repo_id, repo_name]
+aggregations:
+  - {name: event_count, op: count}
+  - {name: unique_actors, op: distinct_count, column: actor_login}
+  - {name: avg_payload_size, op: mean, column: payload_size}
+
+join:
+  path: "${LOOKUP_PATH:s3a://raw-data/lookup/repo_metadata.parquet}"
+  key: repo_id
+  columns: [language, repo_owner_type]
+  missing: unknown
+
+partition_by: language

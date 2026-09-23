@@ -16,9 +16,12 @@ import pandas as pd
 import pyarrow as pa
 import pytest
 
-from data.amplify_skew import amplify, push_events, skew_stats, top_repo_ids
+from data.amplify_skew import amplify, matching_rows, skew_stats, top_keys
 from data.download_gharchive_data import FLAT_SCHEMA
 from engines.base import BenchmarkResult
+from workloads.spec import load_workload
+
+SPEC = load_workload("config/workloads/gharchive-repo-activity.yaml")
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -55,12 +58,12 @@ def _result(engine: str, dataset: str, mitigation: bool, duration: float) -> Ben
 
 def test_hot_repos_ranked_by_push_events_only() -> None:
     # repo 9 has the most rows overall, but only WatchEvents
-    assert top_repo_ids(push_events(_events_table()), 2) == [1, 2]
+    assert top_keys(matching_rows(_events_table(), SPEC), SPEC, 2) == [1, 2]
 
 
 def test_amplify_replicates_only_hot_rows() -> None:
     table = _events_table()
-    skewed = amplify(table, [1], skew_factor=10)
+    skewed = amplify(table, [1], SPEC, skew_factor=10)
     counts = skewed.to_pandas()["repo_id"].value_counts()
 
     assert counts[1] == 6 * 10
@@ -70,7 +73,7 @@ def test_amplify_replicates_only_hot_rows() -> None:
 
 
 def test_amplified_rows_get_unique_ids_and_keep_actors() -> None:
-    skewed = amplify(_events_table(), [1], skew_factor=4).to_pandas()
+    skewed = amplify(_events_table(), [1], SPEC, skew_factor=4).to_pandas()
     assert skewed["id"].is_unique
     hot = skewed[skewed["repo_id"] == 1]
     assert set(hot["actor_login"]) == {"a", "b", "c", "bot"}  # distinct actors unchanged
@@ -78,18 +81,18 @@ def test_amplified_rows_get_unique_ids_and_keep_actors() -> None:
 
 def test_skew_factor_one_is_identity() -> None:
     table = _events_table()
-    assert amplify(table, [1], skew_factor=1).num_rows == table.num_rows
+    assert amplify(table, [1], SPEC, skew_factor=1).num_rows == table.num_rows
 
 
 def test_amplify_rejects_invalid_factor() -> None:
     with pytest.raises(ValueError):
-        amplify(_events_table(), [1], skew_factor=0)
+        amplify(_events_table(), [1], SPEC, skew_factor=0)
 
 
 def test_skew_stats_increase_after_amplification() -> None:
-    pushes = push_events(_events_table())
-    before = skew_stats(pushes, top_n=1)
-    after = skew_stats(amplify(pushes, [1], skew_factor=10), top_n=1)
+    pushes = matching_rows(_events_table(), SPEC)
+    before = skew_stats(pushes, SPEC, top_n=1)
+    after = skew_stats(amplify(pushes, [1], SPEC, skew_factor=10), SPEC, top_n=1)
 
     assert before.top_repo_share == pytest.approx(6 / 13)
     assert after.top_repo_share == pytest.approx(60 / 67)
@@ -131,22 +134,29 @@ def _reference_aggregate(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def test_ray_mitigated_pipeline_is_exact() -> None:
-    from engines.ray_engine import _aggregate_bucket, _aggregate_partials, _assign_bucket, _partial_aggregate
+    from engines.ray_engine import (
+        _aggregate_bucket,
+        _aggregate_partials,
+        _assign_bucket,
+        _combine_buckets,
+        _partial_aggregate,
+    )
 
-    df = push_events(amplify(_events_table(), [1], 5)).to_pandas()
+    df = matching_rows(amplify(_events_table(), [1], SPEC, 5), SPEC).to_pandas()
     blocks = (df.iloc[:10], df.iloc[10:25], df.iloc[25:])
 
-    # Unmitigated: bucket by repo, aggregate each bucket.
-    keyed = pd.concat(_assign_bucket(b, num_buckets=4) for b in blocks)
-    direct = pd.concat(_aggregate_bucket(g) for _, g in keyed.groupby("bucket"))
+    # Unmitigated: bucket by group key, aggregate each bucket.
+    keyed = pd.concat(_assign_bucket(b, num_buckets=4, key_columns=SPEC.group_by) for b in blocks)
+    direct = pd.concat(_aggregate_bucket(g, spec=SPEC) for _, g in keyed.groupby("bucket"))
 
-    # Mitigated: map-side partials, hot repo spread across buckets by actor, recombine.
-    partials = pd.concat(_partial_aggregate(b) for b in blocks)
-    spread = _assign_bucket(partials, num_buckets=4, hot_ids={1})
+    # Mitigated: map-side partials, hot key spread across buckets by the
+    # distinct column, then per-bucket aggregation and a final combine.
+    partials = pd.concat(_partial_aggregate(b, spec=SPEC) for b in blocks)
+    spread = _assign_bucket(partials, num_buckets=4, key_columns=SPEC.group_by,
+                            hot_keys={1}, skew_key=SPEC.skew_key, spread_column="actor_login")
     assert spread.loc[spread["repo_id"] == 1, "bucket"].nunique() > 1
-    per_bucket = pd.concat(_aggregate_partials(g) for _, g in spread.groupby("bucket"))
-    combined = per_bucket.groupby(["repo_id", "repo_name"], as_index=False).sum(numeric_only=True)
-    combined["avg_payload_size"] = combined["psum"] / combined["pcnt"]
+    per_bucket = pd.concat(_aggregate_partials(g, spec=SPEC) for _, g in spread.groupby("bucket"))
+    combined = _combine_buckets(per_bucket, SPEC)
     cols = ["repo_id", "repo_name", "event_count", "unique_actors", "avg_payload_size"]
 
     expected = _reference_aggregate(df)
@@ -158,14 +168,16 @@ def test_ray_mitigated_pipeline_is_exact() -> None:
 def test_dask_salt_only_touches_hot_repos() -> None:
     from engines.dask_engine import _add_salt
 
-    df = push_events(amplify(_events_table(), [1], 5)).to_pandas()
-    salted = _add_salt(df, {1}, buckets=4)
+    df = matching_rows(amplify(_events_table(), [1], SPEC, 5), SPEC).to_pandas()
+    salted = _add_salt(df, {1}, 4, SPEC.skew_key, SPEC.row_id)
 
     assert set(salted.loc[salted["repo_id"] != 1, "salt"]) == {0}
     assert salted.loc[salted["repo_id"] == 1, "salt"].nunique() > 1
     assert salted["salt"].between(0, 3).all()
     # deterministic: same id → same salt
-    pd.testing.assert_series_equal(salted["salt"], _add_salt(df, {1}, buckets=4)["salt"])
+    pd.testing.assert_series_equal(
+        salted["salt"], _add_salt(df, {1}, 4, SPEC.skew_key, SPEC.row_id)["salt"]
+    )
 
 
 # ---------------------------------------------------------------------------
