@@ -78,4 +78,4 @@ error instead of silently over-counting; Spark and Dask have no such limit.
 - [x] README documents the data contract, supported ops and measured data shape
 - [x] 24h matrix re-measured; an A/B against pre-refactor code showed the
       differences were run-order/cache effects, not the refactor
-- [ ] CI green, including cluster smoke
+- [x] CI green, including cluster smoke
