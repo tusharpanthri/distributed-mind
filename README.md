@@ -142,40 +142,40 @@ The Spark master UI is at http://localhost:8080 and the Dask dashboard at http:/
 
 ## Results
 
-Measured with `docker compose run --rm benchmark` on a Windows 11 desktop (Docker Desktop, 16 vCPU / 14 GB), **each engine limited to 4 cores** (Spark `local[4]`, Dask 2 workers × 2 threads, Ray `num_cpus=4`). Each engine got one untimed warmup, then **the median of 3 runs** per configuration.
+Measured with `docker compose run --rm benchmark --repeats 3` on a Windows 11 desktop (Docker Desktop, 16 vCPU / 14 GB), **each engine limited to 4 cores** (Spark `local[4]`, Dask 2 workers × 2 threads, Ray `num_cpus=4`). Each engine got one untimed warmup, then **the median of 3 runs** per configuration.
 
-The data is GH Archive 2024-01-15, hours 0–2:
+The data is a full **24h GH Archive day** (2024-01-15), ingested as row-bounded Parquet chunks:
 
-- **balanced:** 432,459 PushEvents over 119,942 repos
-- **skewed:** the top-5 repos replicated ×10 → 772,389 PushEvents. The top repo's share goes 1.75% → 9.82%, the top-5 share goes 8.73% → 48.90%, and max/median events per repo goes 7,581× → 75,810×.
+- **balanced:** 3,682,194 PushEvents over 572,369 repos
+- **skewed:** the top-5 repos replicated ×10 → 6,240,579 PushEvents. The top repo's share goes 1.55% → 9.16%, the top-5 share goes 7.72% → 45.55%, and max/median events per repo goes 28,574× → 285,745×.
 
-The whole 12-run matrix (36 timed runs plus warmups) takes **3m39s**.
+The whole 12-run matrix (36 timed runs plus warmups) takes **13m17s**.
 
 | Engine | Dataset | Mitigation | Duration (s) | Rows/sec | Rows in | Rows out | Skew slowdown |
 |---|---|---|---:|---:|---:|---:|---:|
-| spark | balanced | off | 3.08 | 140,596 | 432,459 | 119,942 | |
-| spark | balanced | on  | 3.36 | 128,898 | 432,459 | 119,942 | |
-| spark | skewed   | off | 3.40 | 227,140 | 772,389 | 119,942 | **1.11×** |
-| spark | skewed   | on  | 3.98 | 193,926 | 772,389 | 119,942 | **1.19×** |
-| dask  | balanced | off | 2.80 | 154,461 | 432,459 | 119,942 | |
-| dask  | balanced | on  | 6.40 | 67,598  | 432,459 | 119,942 | |
-| dask  | skewed   | off | 2.98 | 258,900 | 772,389 | 119,942 | **1.07×** |
-| dask  | skewed   | on  | 7.13 | 108,338 | 772,389 | 119,942 | **1.11×** |
-| ray   | balanced | off | 4.04 | 107,139 | 432,459 | 119,942 | |
-| ray   | balanced | on  | 4.97 | 87,016  | 432,459 | 119,942 | |
-| ray   | skewed   | off | 6.32 | 122,254 | 772,389 | 119,942 | **1.57×** |
-| ray   | skewed   | on  | 6.93 | 111,412 | 772,389 | 119,942 | **1.39×** |
+| spark | balanced | off | 6.60 | 558,258 | 3,682,194 | 572,369 | |
+| spark | balanced | on  | 8.28 | 444,527 | 3,682,194 | 572,369 | |
+| spark | skewed   | off | 8.01 | 779,044 | 6,240,579 | 572,369 | **1.21×** |
+| spark | skewed   | on  | 9.26 | 674,286 | 6,240,579 | 572,369 | **1.12×** |
+| dask  | balanced | off | 9.36 | 393,284 | 3,682,194 | 572,369 | |
+| dask  | balanced | on  | 11.91 | 309,090 | 3,682,194 | 572,369 | |
+| dask  | skewed   | off | 11.76 | 530,757 | 6,240,579 | 572,369 | **1.26×** |
+| dask  | skewed   | on  | 14.06 | 443,836 | 6,240,579 | 572,369 | **1.18×** |
+| ray   | balanced | off | 30.29 | 121,551 | 3,682,194 | 572,369 | |
+| ray   | balanced | on  | 36.87 | 99,875 | 3,682,194 | 572,369 | |
+| ray   | skewed   | off | 42.00 | 148,591 | 6,240,579 | 572,369 | **1.39×** |
+| ray   | skewed   | on  | 43.80 | 142,466 | 6,240,579 | 572,369 | **1.19×** |
 
-*Skew slowdown* = skewed duration ÷ balanced duration for the same engine and mitigation setting. The skewed dataset has 1.79× the rows, so any ratio below 1.79 means per-row throughput held up under skew. Every configuration produces the same 119,942 output rows, and the tests check the values match too.
+*Skew slowdown* = skewed duration ÷ balanced duration for the same engine and mitigation setting. The skewed dataset has 1.69× the rows, so any ratio below 1.69 means per-row throughput held up under skew. Every configuration produces the same 572,369 output rows, and the tests check the values match too.
 
 **What the numbers say**
 
-- **Spark and Dask shrug off key skew on this workload.** Both do **map-side partial aggregation** before the shuffle: Spark's `HashAggregate` runs a partial and a final stage, and Dask's groupby uses a tree reduction. So the 10× replicated rows of a hot repo collapse to one partial row per partition before any worker has to handle them. Skew adds only 7–11%.
-- **Ray is the most skew-sensitive (1.57×).** Its key-partitioned path has no map-side combine, so every row of a hot repo lands in one bucket and one task becomes a straggler. Mitigation cuts the slowdown to **1.39×**.
-- **Mitigation isn't free.** On the balanced dataset every mitigated run is slower (Spark +9%, Ray +23%, Dask +129%). Each mitigated run pays for a hot-key detection pass and an extra shuffle stage. Dask pays most because its extra `split_out` shuffles are task-based.
-- **Fixed overhead dominates at this size.** At a few seconds per job, scheduling and I/O setup are a large share of the runtime. That's why Dask, the lightest-weight scheduler here, leads on raw duration. The ranking can change at larger scale.
+- **Spark is fastest, Ray is 4.6× slower.** Spark's JVM aggregation and parallel Parquet reads win at this size; Ray pays for moving every row through Python. Dask sits between them.
+- **Mitigation reduces the skew penalty for all three engines** — Spark 1.21× → 1.12×, Dask 1.26× → 1.18×, Ray 1.39× → 1.19×. At the 10× smaller dataset this project used earlier, it didn't help Spark or Dask at all; hot keys have to be big enough to actually hurt before spreading them pays.
+- **Mitigation still isn't free.** On balanced data every mitigated run is slower (Spark +25%, Dask +27%, Ray +22%): each pays for a hot-key detection pass and an extra shuffle stage that buys nothing when no key is hot.
+- **Ray is the most skew-sensitive unmitigated (1.39×)**, because its key-partitioned path has no map-side combine — every row of a hot repo lands in one bucket and one task becomes a straggler. That's also why mitigation helps it most.
 
-> **Ray Data implementation note.** Ray 2.20's built-in `groupby().aggregate()` and `map_groups` iterate over groups in Python. With 120k repo keys that took **240 s** (built-in aggregations) or **65 s** (`map_groups`) for the balanced dataset. The engine therefore hash-partitions rows into `2 × num_cpus` buckets, groups on the low-cardinality bucket id, and aggregates each bucket with vectorized pandas: **4.0 s**.
+> **Ray Data implementation note.** Ray 2.20's built-in `groupby().aggregate()` and `map_groups` iterate over groups in Python. Measured on a 432k-row subset with 120k repo keys, that took **240 s** (built-in aggregations) or **65 s** (`map_groups`). The engine therefore hash-partitions rows into `2 × num_cpus` buckets, groups on the low-cardinality bucket id, and aggregates each bucket with vectorized pandas: **4.0 s** on the same subset.
 
 ---
 
@@ -234,7 +234,7 @@ Each engine's `run()` takes `dataset_type` and `mitigate_skew`. With mitigation 
 
 Correctness is tested at two levels. Unit tests check that each partial/combine helper reproduces a direct pandas aggregate exactly. Integration tests check that every engine's mitigated output equals its unmitigated output on the real skewed data.
 
-Measured effect: mitigation lowered Ray's skew slowdown from 1.57× to 1.39×. It didn't help Spark or Dask, whose built-in partial aggregation already neutralizes key skew for a combinable aggregate like this one. Salting pays off where there's no combiner: skewed **joins**, per-key UDFs, `collect_list`-style aggregates, or a hot key too big for one executor's memory.
+Measured effect on the 24h dataset: mitigation cut the skew slowdown for every engine — Spark 1.21× → 1.12×, Dask 1.26× → 1.18×, Ray 1.39× → 1.19× — while costing 22–27% on balanced data where nothing is hot. On a 10× smaller dataset the same code showed no benefit for Spark or Dask, whose built-in partial aggregation already absorbed the hot keys; the hot key has to be large enough to matter first. Salting pays off soonest where there's no combiner: skewed **joins**, per-key UDFs, `collect_list`-style aggregates, or a hot key too big for one executor's memory.
 
 ---
 
@@ -250,18 +250,18 @@ Measured effect: mitigation lowered Ray's skew slowdown from 1.57× to 1.39×. I
 
 `BenchmarkEngine.run` (shared by all three engines) catches the failure and retries the job with exponential backoff: `delay = min(backoff_max, backoff_base · 2^attempt)`, with `max_retries` from `config/benchmark_config.yaml`. It records `retry_count` and `recovery_time_seconds` (first failure → successful completion). Clean timing runs and fault runs push to separate Prometheus jobs, so injected failures never skew the timing panels.
 
-Measured recovery from `docker compose run --rm benchmark -m benchmark.runner --simulate-failure`. Every job succeeded after 1 retry, with 0 failed jobs:
+Measured with `docker compose run --rm benchmark -m benchmark.runner --simulate-failure` on the 24h dataset. Every job succeeded after 1 retry, with 0 failed jobs:
 
 | Engine | Mitigation | Retries | Recovery time (s) | Skewed duration with failure (s) | Clean skewed duration (s) |
 |---|---|---:|---:|---:|---:|
-| spark | off | 1 | 4.64 | 5.72 | 3.40 |
-| spark | on  | 1 | 5.01 | 5.37 | 3.98 |
-| dask  | off | 1 | 3.86 | 4.63 | 2.98 |
-| dask  | on  | 1 | 7.61 | 8.21 | 7.13 |
-| ray   | off | 1 | 7.21 | 7.65 | 6.32 |
-| ray   | on  | 1 | 7.75 | 8.16 | 6.93 |
+| spark | off | 1 | 8.29 | 9.36 | 8.01 |
+| spark | on  | 1 | 10.03 | 10.41 | 9.26 |
+| dask  | off | 1 | 11.67 | 11.97 | 11.76 |
+| dask  | on  | 1 | 14.01 | 14.24 | 14.06 |
+| ray   | off | 1 | 41.83 | 42.22 | 42.00 |
+| ray   | on  | 1 | 44.83 | 45.23 | 43.80 |
 
-Recovery time is roughly one backoff (0.5 s) plus a full re-run, because the failure is raised early in the job. The added wall time over a clean run is 1–2.3 s. `tests/test_fault_tolerance.py` checks the retry/backoff logic (including the capped exponential schedule and giving up after `max_retries`) and that each real engine recovers from an injected worker failure.
+Recovery time is roughly one backoff (0.5 s) plus a full re-run, because the failure is raised early in the job — so it tracks each engine's own runtime, from 8 s for Spark to 45 s for Ray. The added wall time over a clean run is small (0.2–1.4 s) because the failed attempt aborts almost immediately. `tests/test_fault_tolerance.py` checks the retry/backoff logic (including the capped exponential schedule and giving up after `max_retries`) and that each real engine recovers from an injected worker failure.
 
 ---
 
@@ -294,19 +294,19 @@ Every component also logs structured JSON.
 
 ## Cost implications
 
-What would the measured throughput cost on AWS? This is a cost model only; nothing runs in the cloud. Each engine used 4 cores, which maps to one **m5.xlarge** (4 vCPU, 16 GiB; every run's peak memory stayed well under 1 GB). Prices are us-east-1 on-demand list prices: **$0.192/h** for EC2, and **+$0.048/h** EMR uplift for Spark on EMR.
+What would the measured throughput cost on AWS? This is a cost model only; nothing runs in the cloud. Each engine used 4 cores, which maps to one **m5.xlarge** (4 vCPU, 16 GiB). Prices are us-east-1 on-demand list prices: **$0.192/h** for EC2, and **+$0.048/h** EMR uplift for Spark on EMR.
 
 | Engine (platform) | $/hour | Rows/sec (balanced, no mitigation) | Cost per 1B PushEvents | With mitigation |
 |---|---:|---:|---:|---:|
-| Spark (EMR) | $0.240 | 140,596 | **$0.47** | $0.52 |
-| Dask (EC2)  | $0.192 | 154,461 | **$0.35** | $0.79 |
-| Ray (EC2)   | $0.192 | 107,139 | **$0.50** | $0.61 |
+| Spark (EMR) | $0.240 | 558,258 | **$0.12** | $0.15 |
+| Dask (EC2)  | $0.192 | 393,284 | **$0.14** | $0.17 |
+| Ray (EC2)   | $0.192 | 121,551 | **$0.44** | $0.53 |
 
 Cost per 1B rows = (1e9 / rows_per_sec) / 3600 × $/hour. Takeaways for production:
 
-- **At equal cores, Dask was about 25% cheaper than Spark on EMR** for this aggregation, and Spark's EMR uplift alone is 25% of its bill. At scale, Spark's advantages (AQE, a mature S3A connector, spill-to-disk) usually justify that, and EMR on Spot or EMR Serverless changes the maths.
-- **Always-on mitigation is a cost, not a safety net.** It roughly doubles Dask's bill and adds 10–20% for Spark and Ray on data that doesn't need it. Enable it only when hot keys are detected, since detection is itself a cheap `groupBy().count()`.
-- These figures come from about 3 s jobs, where fixed overhead is a big share of the runtime. Linear extrapolation to billions of rows is optimistic for all three engines, but it's consistent across them, so the relative comparison holds.
+- **Spark is cheapest per row even after paying the EMR uplift**, and that uplift is 25% of its bill — on plain EC2 the same throughput would be ~$0.10/1B. Ray costs ~3.6× more for identical output, which is the price of doing the aggregation in Python.
+- **Always-on mitigation costs 20–25%** on data that doesn't need it. Enable it when hot keys are detected, since detection is itself a cheap `groupBy().count()`.
+- Extrapolating ~7–30 s jobs to a billion rows assumes throughput holds, which the scaling section shows it does not do perfectly — but the assumption is applied identically to all three engines, so the relative comparison holds.
 
 ---
 
